@@ -1978,10 +1978,15 @@ class ServerArgs:
                     self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
 
+            # Enable cache-isolation extra_buffer mode for NemotronH so spec
+            # decode can run alongside mamba prefix caching. The underlying
+            # mamba kernels handle the cache isolation correctly when the
+            # Mamba2AttnBackend conv_states_shape init bug is also fixed
+            # (see hybrid_linear_attn_backend.py).
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
+                support_mamba_cache_extra_buffer=True,
                 sm100_default_attention_backend="flashinfer",
             )
             assert self.attention_backend != "triton", (

@@ -641,6 +641,15 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         config = model_runner.mamba2_config
         assert config is not None
         self.mamba_chunk_size = config.mamba_chunk_size
+        # GDNAttnBackend sets self.conv_states_shape in its __init__ but
+        # Mamba2AttnBackend forgot to. The shared `_init_track_conv_indices`
+        # code path in MambaAttnBackendBase references it (line ~265), so
+        # without this set, NemotronH + mamba_extra_buffer + spec decode
+        # crashes with `TypeError: 'NoneType' object is not subscriptable`.
+        # Mirror the GDN init pattern.
+        self.conv_states_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
