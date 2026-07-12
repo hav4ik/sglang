@@ -70,13 +70,23 @@ def probe(url, model, lengths, output_tokens, timeout):
 
 def reload(url, model_path, version, timeout, load_format):
     post(url, "/pause_generation", {"mode": "abort"}, timeout)
+    idle_timeout = min(timeout, 120.0)
+    post(
+        url,
+        f"/flush_cache?timeout={idle_timeout:g}",
+        {},
+        idle_timeout + 5.0,
+    )
     result = post(
         url,
         "/update_weights_from_disk",
         {
             "model_path": model_path,
             "weight_version": str(version),
-            "flush_cache": True,
+            # The deferred flush above is both an idle barrier and a cache
+            # invalidation while generation is paused. A post-update flush can
+            # race scheduler retirement of the final completed request.
+            "flush_cache": False,
             "load_format": load_format,
         },
         timeout,

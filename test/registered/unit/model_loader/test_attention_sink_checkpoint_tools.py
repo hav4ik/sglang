@@ -1,4 +1,5 @@
 import json
+from unittest.mock import call, patch
 
 import pytest
 import torch
@@ -9,6 +10,7 @@ from scripts.attention_sink.make_sink_variant import clone_reflink, patch_sink_t
 from scripts.attention_sink.compare_probes import compare_probe_reports
 from scripts.attention_sink.probe_server import (
     assert_probe_changed,
+    reload as reload_server,
     summarize_probe_delta,
     validate_generation_result,
 )
@@ -149,6 +151,33 @@ def test_require_update_success_rejects_failed_or_malformed_results():
         require_update_success((False, "bad"), "update")
     with pytest.raises(RuntimeError, match="invalid result"):
         require_update_success(None, "update")
+
+
+def test_reload_waits_for_idle_flush_before_updating_weights():
+    update_result = {"success": True, "message": "ok"}
+    with patch(
+        "scripts.attention_sink.probe_server.post",
+        side_effect=[{"status": "ok"}, "Cache flushed", update_result, {}],
+    ) as post_mock:
+        result = reload_server("http://server", "/models/b", 7, 1800, "flash_rl")
+
+    assert result is update_result
+    assert post_mock.call_args_list == [
+        call("http://server", "/pause_generation", {"mode": "abort"}, 1800),
+        call("http://server", "/flush_cache?timeout=120", {}, 125.0),
+        call(
+            "http://server",
+            "/update_weights_from_disk",
+            {
+                "model_path": "/models/b",
+                "weight_version": "7",
+                "flush_cache": False,
+                "load_format": "flash_rl",
+            },
+            1800,
+        ),
+        call("http://server", "/continue_generation", {}, 1800),
+    ]
 
 
 def test_validate_generation_result_requires_ids_and_logprobs():
