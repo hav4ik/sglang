@@ -177,6 +177,12 @@ Triton-versus-FlashInfer comparisons for BF16 and FP8 E4M3 KV caches. Set
 `KV_CACHE_DTYPES=auto` only for a faster diagnostic run; release qualification
 must run both defaults.
 
+Reload validation needs transient device memory beyond the static model and KV
+allocations. On 80 GB GPUs, lower `MEMFRAC` if reload runs out of memory. For
+batch-one smoke tests, set `CUDA_GRAPH_MAX_BS_DECODE=1` and
+`CUDA_GRAPH_MAX_BS_PREFILL=1`; this still captures and replays both graph paths
+without reserving graph pools for batch sizes the smoke test never sends.
+
 The release checkpoint is `chankhavu/yccchen-olmo3-deploy` at revision
 `39beac79e6857df6d8a0dc27210f5affa4031c92`. It is a 32.5B BF16 model, so use
 TP=2 on 80 GB H100 and qualify both TP=1 and TP=2 on B200. Download it once to

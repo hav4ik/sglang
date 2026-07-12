@@ -115,10 +115,17 @@ for backend in $BACKENDS; do
   label="$backend-$kv_cache_dtype-$quantization"
   log="$RESULTS/server-$label.log"
   quantization_args=()
+  cuda_graph_args=()
   load_format=auto
   if [ "$quantization" != none ]; then
     quantization_args=(--quantization "$quantization")
     load_format=flash_rl
+  fi
+  if [ -n "${CUDA_GRAPH_MAX_BS_DECODE:-}" ]; then
+    cuda_graph_args+=(--cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS_DECODE")
+  fi
+  if [ -n "${CUDA_GRAPH_MAX_BS_PREFILL:-}" ]; then
+    cuda_graph_args+=(--cuda-graph-max-bs-prefill "$CUDA_GRAPH_MAX_BS_PREFILL")
   fi
   if ! "$PYTHON" - "$PORT" <<'PY'
 import socket, sys
@@ -141,6 +148,7 @@ PY
     --host 127.0.0.1 --port "$PORT" \
     --attention-backend "$backend" --page-size 1 \
     "${quantization_args[@]}" --load-format "$load_format" \
+    "${cuda_graph_args[@]}" \
     --kv-cache-dtype "$kv_cache_dtype" \
     --context-length "${CONTEXT_LEN:-131328}" \
     --chunked-prefill-size "${CHUNKED_PREFILL:-4096}" \
