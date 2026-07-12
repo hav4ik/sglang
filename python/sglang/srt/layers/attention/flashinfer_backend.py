@@ -2182,7 +2182,7 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
-        if self.has_attention_sinks and use_custom_mask is not None:
+        if self.attn_backend.has_attention_sinks and use_custom_mask is not None:
             raise ValueError(
                 "FlashInfer attention-sink kernels do not support custom masks; "
                 "use --attention-backend triton"

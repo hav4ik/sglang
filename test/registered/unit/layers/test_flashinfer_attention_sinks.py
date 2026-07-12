@@ -8,6 +8,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
+    FlashInferIndicesUpdaterPrefill,
     SGLangBatchAttentionWithAttentionSinkWrapper,
     _run_flashinfer_paged_with_sinks,
 )
@@ -24,6 +25,19 @@ class _FakeFlashInferWrapper:
         self.run_args = (q, paged_kv_cache, *args)
         self.run_kwargs = kwargs
         return q
+
+
+class _FakeTritonKernel:
+    def __getitem__(self, _grid):
+        return lambda *_args, **_kwargs: None
+
+
+class _FakePrefillWrapper:
+    _sglang_sink_window_left = 32
+
+    def begin_forward(self, *args, **kwargs):
+        self.begin_forward_args = args
+        self.begin_forward_kwargs = kwargs
 
 
 def test_flashinfer_native_sink_run_sets_runtime_options():
@@ -182,6 +196,43 @@ def test_sink_models_disable_ragged_prefill():
 
     assert backend.indices_updater_prefill.kwargs["use_ragged"] is False
     assert backend.forward_metadata.use_ragged is False
+
+
+def test_sink_prefill_indices_updater_reads_backend_flag():
+    updater = FlashInferIndicesUpdaterPrefill.__new__(FlashInferIndicesUpdaterPrefill)
+    updater.attn_backend = SimpleNamespace(has_attention_sinks=True)
+    updater.req_to_token = torch.zeros((1, 4), dtype=torch.int32)
+    updater.kv_last_page_len = torch.ones(1, dtype=torch.int32)
+    updater.num_qo_heads = 2
+    updater.num_kv_heads = 1
+    updater.head_dim = 8
+    updater.q_data_type = torch.bfloat16
+    updater.data_type = torch.bfloat16
+    updater._swa_kv_pool = None
+    wrapper = _FakePrefillWrapper()
+
+    target = (
+        "sglang.srt.layers.attention.flashinfer_backend."
+        "create_flashinfer_kv_indices_triton"
+    )
+    with patch(target, _FakeTritonKernel()):
+        updater.call_begin_forward(
+            wrapper_ragged=object(),
+            wrapper_paged=wrapper,
+            req_pool_indices=torch.zeros(1, dtype=torch.int32),
+            paged_kernel_lens=torch.ones(1, dtype=torch.int32),
+            paged_kernel_lens_sum=1,
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            prefix_lens=torch.zeros(1, dtype=torch.int32),
+            kv_start_idx=torch.zeros(1, dtype=torch.int32),
+            kv_indptr=torch.zeros(2, dtype=torch.int32),
+            qo_indptr=torch.zeros(2, dtype=torch.int32),
+            use_ragged=False,
+            spec_info=None,
+        )
+
+    assert wrapper.begin_forward_kwargs["custom_mask"] is None
+    assert wrapper.begin_forward_kwargs["window_left"] == 32
 
 
 def test_gpt_oss_defaults_to_flashinfer_when_available():
