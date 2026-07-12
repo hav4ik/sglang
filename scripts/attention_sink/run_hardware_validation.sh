@@ -186,6 +186,9 @@ PY
   )
   if [ "$PROFILE" = rl ]; then
     probe_args+=(--reload-model "$RELOAD_MODEL" --reload-load-format "$load_format")
+    if [ "$load_format" = flash_rl ] && [ "${WARM_RELOAD:-1}" = 1 ]; then
+      probe_args+=(--warm-reload)
+    fi
     if [ "${REQUIRE_RELOAD_CHANGE:-1}" = 1 ]; then
       probe_args+=(--require-reload-change)
     fi

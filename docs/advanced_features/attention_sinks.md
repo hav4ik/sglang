@@ -103,6 +103,14 @@ An aborted rollout retries the same prompt after the pause gate opens, so no
 trajectory spans a weight boundary. If any stage fails, the global version does
 not advance and paused replicas remain paused.
 
+FP8 qualification uses `cold A0 -> reload A1 -> reload B -> reload A2` and
+requires strict A1/A2 parity. Cold startup quantizes row-parallel weights after
+TP input-column slicing, while FlashRL quantizes the global row before slicing;
+their per-channel scales can differ even for the same BF16 checkpoint. The
+cold-A0/A1 delta is retained in the result report, not hidden by a looser
+tolerance. A1/A2 exercise the same production reload path and must match. Sink
+checksums are compared exactly on every TP rank across A1, B, and A2.
+
 ## Local Tests
 
 ```bash
@@ -264,6 +272,8 @@ Acceptance criteria:
   test; the provided H100/B200 matrix covers TP 1/2.
 - Non-unit FP8 K/V scales are not covered by the direct kernel fixture.
 - Injected mid-commit GPU failure and single-TP-rank failure need fail-stop tests.
+- Cold-start and FlashRL FP8 quantization of row-parallel projections should be
+  aligned so the initial policy is independent of whether it came through reload.
 - Concurrent generation must be aborted/retried during reload without admitting a
   mixed-version trajectory.
 - The production image must install this fork, pass dependency checks, cold-build

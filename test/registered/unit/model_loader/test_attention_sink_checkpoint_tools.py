@@ -9,6 +9,7 @@ from scripts.attention_sink.make_sink_variant import clone_reflink, patch_sink_t
 from scripts.attention_sink.compare_probes import compare_probe_reports
 from scripts.attention_sink.probe_server import (
     assert_probe_changed,
+    summarize_probe_delta,
     validate_generation_result,
 )
 from scripts.attention_sink.validate_live_sink_update import require_update_success
@@ -123,6 +124,20 @@ def test_assert_probe_changed_rejects_unchanged_reload():
     missing_logprobs = [{**_probe([1], -1.0), "meta_info": {}}]
     with pytest.raises(AssertionError, match="changed logprob count"):
         assert_probe_changed(before, missing_logprobs, 1e-4)
+
+
+def test_summarize_probe_delta_reports_tokens_and_logprobs():
+    summary = summarize_probe_delta(
+        [_probe([1], -1.0)],
+        [_probe([2], -1.25)],
+    )
+    assert summary == [
+        {
+            "prompt_length": 128,
+            "output_ids_equal": False,
+            "max_logprob_abs": 0.25,
+        }
+    ]
 
 
 def test_require_update_success_rejects_failed_or_malformed_results():

@@ -87,6 +87,30 @@ def reload(url, model_path, version, timeout, load_format):
     return result
 
 
+def get_sink_checksums(url, timeout, expected_count):
+    result = post(
+        url,
+        "/weights_checker",
+        {"action": "checksum_attention_sinks"},
+        timeout,
+    )
+    if not result.get("success", False):
+        raise RuntimeError(f"sink checksum rejected: {result}")
+    ranks = result.get("ranks") or []
+    if not ranks:
+        raise RuntimeError("sink checksum returned no TP ranks")
+    for rank in ranks:
+        checksums = rank.get("checksums") or {}
+        if len(checksums) != expected_count:
+            raise RuntimeError(
+                f"sink checksum returned {len(checksums)} tensors on "
+                f"rank {rank.get('parallelism_info')}, expected {expected_count}"
+            )
+    if not result.get("per_engine_checksum"):
+        raise RuntimeError("sink checksum returned no engine checksum")
+    return result
+
+
 def assert_probe_parity(expected, actual, logprob_atol):
     if len(expected) != len(actual):
         raise AssertionError("probe result lengths differ")
@@ -112,6 +136,34 @@ def assert_probe_parity(expected, actual, logprob_atol):
                 f"reload logprob mismatch at length {length}: "
                 f"{max_abs} > {logprob_atol}"
             )
+
+
+def summarize_probe_delta(reference, actual):
+    if len(reference) != len(actual):
+        raise AssertionError("probe result lengths differ")
+    summary = []
+    for before, after in zip(reference, actual, strict=True):
+        length = before["prompt_length"]
+        if after["prompt_length"] != length:
+            raise AssertionError("probe prompt lengths differ")
+        before_lp = (before["meta_info"] or {}).get("output_token_logprobs") or []
+        after_lp = (after["meta_info"] or {}).get("output_token_logprobs") or []
+        if len(before_lp) != len(after_lp):
+            raise AssertionError(f"probe logprob count differs at length {length}")
+        deltas = []
+        for left, right in zip(before_lp, after_lp, strict=True):
+            left_value, right_value = float(left[0]), float(right[0])
+            if not math.isfinite(left_value) or not math.isfinite(right_value):
+                raise AssertionError(f"non-finite logprob at length {length}")
+            deltas.append(abs(left_value - right_value))
+        summary.append(
+            {
+                "prompt_length": length,
+                "output_ids_equal": before["output_ids"] == after["output_ids"],
+                "max_logprob_abs": max(deltas, default=0.0),
+            }
+        )
+    return summary
 
 
 def assert_probe_changed(before, after, min_logprob_delta):
@@ -156,6 +208,8 @@ def main():
     parser.add_argument("--output-tokens", type=int, default=4)
     parser.add_argument("--reload-model")
     parser.add_argument("--reload-load-format", default="flash_rl")
+    parser.add_argument("--warm-reload", action="store_true")
+    parser.add_argument("--expected-sink-count", type=int, default=64)
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--logprob-atol", type=float, default=5e-2)
     parser.add_argument("--require-reload-change", action="store_true")
@@ -165,10 +219,30 @@ def main():
     lengths = [int(value) for value in args.lengths.split(",") if value]
     report = {}
     try:
-        report["initial"] = probe(
+        cold_initial = probe(
             args.url, args.model, lengths, args.output_tokens, args.timeout
         )
+        if args.warm_reload:
+            report["cold_initial"] = cold_initial
+            report["reload_to_warm_a"] = reload(
+                args.url,
+                args.model,
+                0,
+                args.timeout,
+                args.reload_load_format,
+            )
+            report["initial"] = probe(
+                args.url, args.model, lengths, args.output_tokens, args.timeout
+            )
+            report["cold_to_warm_delta"] = summarize_probe_delta(
+                report["cold_initial"], report["initial"]
+            )
+        else:
+            report["initial"] = cold_initial
         if args.reload_model:
+            report["initial_sink_checksums"] = get_sink_checksums(
+                args.url, args.timeout, args.expected_sink_count
+            )
             change_error = None
             restore_error = None
             try:
@@ -186,6 +260,14 @@ def main():
                     args.output_tokens,
                     args.timeout,
                 )
+                report["after_b_sink_checksums"] = get_sink_checksums(
+                    args.url, args.timeout, args.expected_sink_count
+                )
+                if (
+                    report["after_b_sink_checksums"]["per_engine_checksum"]
+                    == report["initial_sink_checksums"]["per_engine_checksum"]
+                ):
+                    raise AssertionError("B reload did not change sink checksums")
                 if args.require_reload_change:
                     assert_probe_changed(
                         report["initial"],
@@ -223,6 +305,14 @@ def main():
             report["after_a"] = probe(
                 args.url, args.model, lengths, args.output_tokens, args.timeout
             )
+            report["after_a_sink_checksums"] = get_sink_checksums(
+                args.url, args.timeout, args.expected_sink_count
+            )
+            if (
+                report["after_a_sink_checksums"]["per_engine_checksum"]
+                != report["initial_sink_checksums"]["per_engine_checksum"]
+            ):
+                raise AssertionError("A restore did not restore exact sink checksums")
             assert_probe_parity(report["initial"], report["after_a"], args.logprob_atol)
             if change_error is not None:
                 raise change_error
