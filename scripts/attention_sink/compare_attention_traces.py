@@ -3,11 +3,16 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
 
-from scripts.attention_sink.kernel_test_utils import (
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.attention_sink.kernel_test_utils import (  # noqa: E402
     eager_reference,
     flashinfer_attention,
     triton_extend_attention,
