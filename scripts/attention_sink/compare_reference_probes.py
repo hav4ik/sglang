@@ -6,11 +6,16 @@ import json
 from pathlib import Path
 
 
-def load_row(path: Path) -> dict:
+def load_row(path: Path, prompt_length: int | None = None) -> dict:
     report = json.loads(path.read_text())
     rows = report.get("initial") or []
+    if prompt_length is not None:
+        rows = [row for row in rows if row.get("prompt_length") == prompt_length]
     if len(rows) != 1:
-        raise RuntimeError(f"expected one initial probe row in {path}, got {len(rows)}")
+        suffix = "" if prompt_length is None else f" at prompt length {prompt_length}"
+        raise RuntimeError(
+            f"expected one initial probe row{suffix} in {path}, got {len(rows)}"
+        )
     return rows[0]
 
 
@@ -29,11 +34,9 @@ def main() -> None:
     args = parser.parse_args()
 
     reference = load_row(args.reference)
-    triton = load_row(args.triton)
-    flashinfer = load_row(args.flashinfer)
     prompt_length = reference["prompt_length"]
-    if any(row["prompt_length"] != prompt_length for row in (triton, flashinfer)):
-        raise RuntimeError("probe prompt lengths differ")
+    triton = load_row(args.triton, prompt_length)
+    flashinfer = load_row(args.flashinfer, prompt_length)
 
     reference_lp = logprobs(reference)
     triton_lp = logprobs(triton)
