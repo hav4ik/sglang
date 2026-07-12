@@ -6,11 +6,11 @@ import os
 import pytest
 import torch
 
-from test.registered.attention.test_flashinfer_attention_sink import (
-    _eager_reference,
-    _flashinfer_attention,
-    _triton_decode_attention,
-    _triton_extend_attention,
+from scripts.attention_sink.kernel_test_utils import (
+    eager_reference,
+    flashinfer_attention,
+    triton_decode_attention,
+    triton_extend_attention,
 )
 
 pytestmark = [
@@ -65,9 +65,9 @@ def _assert_sink_effect(name, sink_output, no_sink_output, min_relative=5e-2):
 @pytest.mark.parametrize("window_left", [-1, SWA_WINDOW_LEFT])
 def test_long_decode_matches_eager(seq_len, window_left):
     q, k, v, sinks = _inputs(seq_len, 1)
-    expected = _eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
-    flashinfer_out = _flashinfer_attention(q, k, v, sinks, window_left)
-    triton_out = _triton_decode_attention(q, k, v, sinks, window_left)
+    expected = eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
+    flashinfer_out = flashinfer_attention(q, k, v, sinks, window_left)
+    triton_out = triton_decode_attention(q, k, v, sinks, window_left)
     _assert_close("flashinfer/eager decode", flashinfer_out, expected)
     _assert_close("triton/eager decode", triton_out, expected)
     _assert_close("flashinfer/triton decode", flashinfer_out, triton_out)
@@ -77,9 +77,9 @@ def test_long_decode_matches_eager(seq_len, window_left):
 @pytest.mark.parametrize("window_left", [-1, SWA_WINDOW_LEFT])
 def test_long_cached_extend_matches_eager(seq_len, window_left):
     q, k, v, sinks = _inputs(seq_len, 4)
-    expected = _eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
-    flashinfer_out = _flashinfer_attention(q, k, v, sinks, window_left)
-    triton_out = _triton_extend_attention(q, k, v, sinks, window_left)
+    expected = eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
+    flashinfer_out = flashinfer_attention(q, k, v, sinks, window_left)
+    triton_out = triton_extend_attention(q, k, v, sinks, window_left)
     _assert_close("flashinfer/eager extend", flashinfer_out, expected)
     _assert_close("triton/eager extend", triton_out, expected)
     _assert_close("flashinfer/triton extend", flashinfer_out, triton_out)
@@ -93,11 +93,9 @@ def test_sink_extremes_control_denominator(window_left):
         sinks = torch.full(
             (NUM_Q_HEADS,), sink_value, device="cuda", dtype=torch.float32
         )
-        expected = _eager_reference(
-            q, k, v, sinks, causal=True, window_left=window_left
-        )
-        flashinfer_out = _flashinfer_attention(q, k, v, sinks, window_left)
-        triton_out = _triton_decode_attention(q, k, v, sinks, window_left)
+        expected = eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
+        flashinfer_out = flashinfer_attention(q, k, v, sinks, window_left)
+        triton_out = triton_decode_attention(q, k, v, sinks, window_left)
         _assert_close(f"flashinfer/eager sink={sink_value}", flashinfer_out, expected)
         _assert_close(f"triton/eager sink={sink_value}", triton_out, expected)
         norms.append(expected.float().norm().item())
@@ -113,12 +111,12 @@ def test_sink_extremes_control_denominator(window_left):
 def test_fp8_kv_sink_decode(seq_len, window_left):
     q, k, v, sinks = _inputs(seq_len, 1, torch.float8_e4m3fn)
     sinks = sinks + math.log(seq_len)
-    expected = _eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
-    flashinfer_out = _flashinfer_attention(q, k, v, sinks, window_left)
-    triton_out = _triton_decode_attention(q, k, v, sinks, window_left)
+    expected = eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
+    flashinfer_out = flashinfer_attention(q, k, v, sinks, window_left)
+    triton_out = triton_decode_attention(q, k, v, sinks, window_left)
     no_sinks = torch.full_like(sinks, -80.0)
-    flashinfer_no_sink = _flashinfer_attention(q, k, v, no_sinks, window_left)
-    triton_no_sink = _triton_decode_attention(q, k, v, no_sinks, window_left)
+    flashinfer_no_sink = flashinfer_attention(q, k, v, no_sinks, window_left)
+    triton_no_sink = triton_decode_attention(q, k, v, no_sinks, window_left)
     _assert_sink_effect("flashinfer fp8 decode", flashinfer_out, flashinfer_no_sink)
     _assert_sink_effect("triton fp8 decode", triton_out, triton_no_sink)
     _assert_close("flashinfer/eager fp8-kv", flashinfer_out, expected, atol=8e-2)
@@ -134,12 +132,12 @@ def test_fp8_kv_sink_decode(seq_len, window_left):
 def test_fp8_kv_sink_long_cached_extend(window_left):
     q, k, v, sinks = _inputs(MAX_CONTEXT, 4, torch.float8_e4m3fn)
     sinks = sinks + math.log(MAX_CONTEXT)
-    expected = _eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
-    flashinfer_out = _flashinfer_attention(q, k, v, sinks, window_left)
-    triton_out = _triton_extend_attention(q, k, v, sinks, window_left)
+    expected = eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
+    flashinfer_out = flashinfer_attention(q, k, v, sinks, window_left)
+    triton_out = triton_extend_attention(q, k, v, sinks, window_left)
     no_sinks = torch.full_like(sinks, -80.0)
-    flashinfer_no_sink = _flashinfer_attention(q, k, v, no_sinks, window_left)
-    triton_no_sink = _triton_extend_attention(q, k, v, no_sinks, window_left)
+    flashinfer_no_sink = flashinfer_attention(q, k, v, no_sinks, window_left)
+    triton_no_sink = triton_extend_attention(q, k, v, no_sinks, window_left)
     _assert_sink_effect("flashinfer fp8 extend", flashinfer_out, flashinfer_no_sink)
     _assert_sink_effect("triton fp8 extend", triton_out, triton_no_sink)
     _assert_close("flashinfer/eager fp8 extend", flashinfer_out, expected, atol=8e-2)
