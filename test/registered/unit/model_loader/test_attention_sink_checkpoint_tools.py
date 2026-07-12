@@ -14,7 +14,10 @@ from scripts.attention_sink.probe_server import (
     summarize_probe_delta,
     validate_generation_result,
 )
-from scripts.attention_sink.validate_live_sink_update import require_update_success
+from scripts.attention_sink.validate_live_sink_update import (
+    require_update_success,
+    validate_live_update_quantization,
+)
 
 
 def _probe(output_ids, logprob):
@@ -151,6 +154,12 @@ def test_require_update_success_rejects_failed_or_malformed_results():
         require_update_success((False, "bad"), "update")
     with pytest.raises(RuntimeError, match="invalid result"):
         require_update_success(None, "update")
+
+
+def test_sink_only_live_update_rejects_flash_rl_quantization():
+    validate_live_update_quantization("none")
+    with pytest.raises(ValueError, match="complete A -> B -> A disk-reload cycle"):
+        validate_live_update_quantization("fp8")
 
 
 def test_reload_preserves_kv_for_in_place_async_rl_update():

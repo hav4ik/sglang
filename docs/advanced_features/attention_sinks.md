@@ -32,6 +32,69 @@ FlashInfer's own dtype-complete sink URI helper when constructing the otherwise
 identical custom kernel, preventing a shared BF16 cache entry from being reused
 as FP8 (or vice versa).
 
+### FP8 weights and FP8 KV are independent
+
+Two unrelated command-line settings contain the term "FP8":
+
+| Setting | What is quantized | Sink implication |
+|---|---|---|
+| `--quantization fp8` | Linear model weights through FlashRL | Sinks stay FP32 at runtime; KV stays BF16 when `--kv-cache-dtype auto` |
+| `--kv-cache-dtype fp8_e4m3` | Stored attention K/V tensors | Sinks still stay FP32, but token logits and value mixtures use quantized K/V |
+
+Consequently, an `fp8/auto` result exercises FP8 weights with BF16 KV and does
+not exercise the FP8-KV behavior described below. The observed H100 full-model
+backend deltas of `0.217067` (`fp8/auto`) and `0.110017` (`none/auto`) are not
+caused by FP8 KV.
+
+### FP8-KV current-chunk policy
+
+The sink equation itself is unchanged under FP8 KV. FlashInfer receives the
+same per-query-head FP32 sink and correctly adds it to the denominator for the
+K/V tensors supplied to its dedicated sink kernel. The backend difference is
+which representation of the current prefill/extend chunk is supplied:
+
+| Execution path | Cached prefix | Current prefill/extend chunk |
+|---|---|---|
+| Yi-Chia patched FA3 training | n/a | BF16 |
+| Yi-Chia custom Triton rollout | dequantized FP8 | BF16 |
+| SGLang Triton | dequantized FP8 | BF16 |
+| SGLang FlashInfer paged | dequantized FP8 | dequantized FP8 |
+| SGLang paged FA3 | dequantized FP8 | dequantized FP8 |
+
+For a query `q`, FP32 sink `s`, an FP8 quantizer `Q`, and attention function
+`A`, an initial no-prefix prefill therefore behaves approximately as:
+
+```text
+Triton:    A(q, K_bf16, V_bf16, s)
+FlashInfer A(q, dequantize(Q(K_bf16)), dequantize(Q(V_bf16)), s)
+```
+
+For cached extend, both use dequantized FP8 prefix K/V, while only Triton keeps
+the new chunk in BF16 for that forward. Once a token has entered the cache,
+decode reads FP8 K/V in both paths. This is an existing paged-backend precision
+policy, not behavior introduced by the attention-sink formula. This branch
+inherited it when it enabled the dedicated FlashInfer sink wrapper.
+
+Quantizing K changes real-token logits and therefore can change the resulting
+sink probability:
+
+```text
+p_sink = exp(s) / (exp(s) + sum_i exp(q K_i / sqrt(d)))
+```
+
+That is the mathematically expected consequence of quantized K, not evidence
+that the sink was dropped or quantized. Quantizing V changes the numerator. The
+direct kernel tests prove that FlashInfer applies the correct sink equation for
+its FP8 inputs; they do not prove equivalence to Triton's mixed FP8-prefix / BF16
+current-chunk policy because those tests intentionally provide both backends the same
+already-quantized K/V.
+
+FP8 KV is therefore a quality and policy-fidelity qualification item rather than
+a known sink-kernel correctness defect. It is acceptable if FlashInfer's normal
+FP8-KV semantics are the desired serving contract and model-level quality is
+gated independently. It is not yet qualified as a faithful reproduction of
+Yi-Chia's training or custom Triton rollout numerics.
+
 ## Checkpoint Contract
 
 The 32B deploy config has 64 layers, 40 query heads, 8 KV heads, hidden size
@@ -70,7 +133,7 @@ The OPD writer performs the same gate before publishing and writes
 | Full attention and OLMo3 SWA | Supported | Supported |
 | CUDA graph decode | Supported | Supported |
 | FP8 weights with BF16 KV | Supported | Supported |
-| FP8 E4M3 KV | Supported on capable GPUs | H100/B200 release gate |
+| FP8 E4M3 KV | Mixed FP8 prefix / BF16 current chunk | FP8 prefix and current chunk; model-quality release gate |
 | Page size `1` | Supported | Supported |
 | Page size greater than `1` | Backend-dependent | Rejected for sink models |
 | DCP | Rejected for sink models | Rejected for sink models |
@@ -238,7 +301,7 @@ proves A parity:
 CUDA_VISIBLE_DEVICES=0,1 python \
   scripts/attention_sink/validate_live_sink_update.py \
   --model /models/yccchen-a --tp 2 --attention-backend flashinfer \
-  --quantization fp8 --kv-cache-dtype fp8_e4m3 \
+  --quantization none --kv-cache-dtype auto \
   --lengths 128,4097,16384 \
   --output /workspace/results/h100-live-flashinfer.json
 ```
@@ -246,7 +309,10 @@ CUDA_VISIBLE_DEVICES=0,1 python \
 The sink-only mutation sends a global 40-head tensor through OLMo's normal model
 loader, which slices a distinct range on every TP rank. It does not use FlashRL,
 because the transactional FlashRL loader requires a complete 771-weight
-checkpoint. The FP8 A -> B -> A cycle above is the full-checkpoint FlashRL test.
+checkpoint. Run this diagnostic with `--quantization none`; a sink-only tensor
+update against a FlashRL model is intentionally rejected as an incomplete
+checkpoint. The FP8 A -> B -> A disk cycle above is the full-checkpoint FlashRL
+test and the relevant OPD v2 path.
 
 ### Backend divergence trace
 
@@ -333,26 +399,98 @@ integration test. A real trainer may need substantially more than one sender GPU
 for parameters, gradients, and optimizer state; three B200s is only the minimum
 synthetic transfer topology, not a full training allocation.
 
-Acceptance criteria:
+### Current deployment envelope
+
+The evidence collected so far supports a controlled H100 canary with this exact
+configuration:
+
+```text
+hardware             H100, TP=2
+attention backend    explicitly triton (default canary) or flashinfer
+weight dtype         BF16 or FlashRL FP8
+KV cache dtype       BF16 / auto
+page size            1
+radix cache          disabled
+DCP / MIS / spec     disabled
+reload source        complete checkpoint from disk
+reload cache policy  flush_cache=false, active-request KV intentionally retained
+tested model context through 16384 tokens
+```
+
+For FlashRL, perform a same-checkpoint warm reload before accepting rollouts so
+cold startup and later policy versions use the same global-before-TP quantization
+path. Do not treat this envelope as qualification for B200, sm120, full-model
+128K, explicit FP8 KV, automatic backend selection, shared radix prefixes, or
+speculative decoding.
+
+### Adversarial audit findings
+
+Independent static audits found no unconditional sink drop in the ordinary
+Triton or dedicated FlashInfer paged paths. They did identify these release and
+test-validity gaps:
+
+1. Production FP8-KV prefill uses the backend-specific current-chunk policies
+   documented above. Existing synthetic tests pre-quantize all K/V and cannot
+   detect this distinction.
+2. The Yi-Chia eager comparator is diagnostic: it reports errors but has no
+   predeclared numerical acceptance threshold. The patched FA3 training kernel is
+   not installed in the rollout image.
+3. Full-model A -> B -> A verifies sink checksums exactly but does not yet compare
+   complete runtime weight and FP8-scale checksums between warm A1 and restored A2.
+4. A sink-only live tensor update cannot pass through the transactional FlashRL
+   loader, which correctly requires all 771 checkpoint weights. Sink-only TP
+   slicing and full FP8 reload are separate tests.
+5. FP8 trace files do not capture cache dtype, K/V scales, page tables, or prefix
+   metadata. They must not be interpreted as FP8-cache replays.
+6. Trace comparison gates the selected replay layer, while the all-layer deltas
+   are diagnostic. Qualification must replay a predeclared layer set on every TP
+   rank rather than relying on the printed all-layer table.
+7. Result and trace directories need fresh-run provenance. Reusing a directory
+   can mix artifacts from different commits or backend configurations.
+8. Calibrated FP8-KV checkpoints may contain `self_attn.{k,v}_scale`; OLMo still
+   needs the standard remapping to RadixAttention's
+   `self_attn.attn.{k,v}_scale` before those artifacts are qualified.
+9. No-flush reload with shared radix prefixes admits old-policy KV reuse by new
+   requests. Current AsyncRL qualification disables radix; production must keep
+   it disabled or implement versioned/invalidation semantics.
+10. Automatic H100/B200 backend selection includes paths outside the explicit
+    Triton/FlashInfer matrix. Sink deployments must select a qualified backend
+    explicitly until FA3 and TRT-LLM MHA are separately tested.
+
+The audit changes the confidence classification, not the sink equation: BF16-KV
+kernel and trace results remain valid, while FP8-KV and broad deployment claims
+need the additional gates below.
+
+Release acceptance criteria (the current canary does not yet satisfy every row):
 
 - No FP8 test skips on H100 (`sm90`) or B200 (`sm100`).
 - Kernel comparisons pass at declared BF16/FP8 tolerances.
+- Production FP8-KV prefill and cached extend are measured using each backend's
+  actual cache-write path; synthetic already-quantized K/V is not sufficient.
 - Sentinel sinks `-20`, `0`, and `+8` materially change output as eager predicts.
 - Triton and FlashInfer produce identical greedy server tokens.
 - Output-token logprobs differ by at most `0.05`.
 - A -> B -> A reproduces A's output IDs and logprobs.
+- Warm A1 and restored A2 have identical complete per-rank runtime checksums,
+  including FP8 weight scales, not only identical sink checksums.
 - Every TP rank reports 64 sink checksums, updated shards are rank-distinct, and
   restore reproduces the original per-engine sink checksum exactly.
 - A request observed as running before an in-place update completes all requested
   decode tokens after the no-flush update resumes generation.
 - Cold head-dimension-128 FlashInfer JIT succeeds in an offline B200 container.
+- Independent patched-FA3 and eager-reference thresholds are declared before
+  running the release prompt corpus; reference comparison exits nonzero on a
+  failed threshold or token mismatch.
+- Every result manifest records an immutable SGLang commit, model revision,
+  backend, weight/KV dtype, graph mode, TP topology, GPU architecture, and run ID.
 
 ## Remaining Gaps
 
 - Real `FlashInferAttnBackend` metadata and RadixAttention need full-server
   coverage; direct wrapper graph tests do not prove them.
 - Full-server FP8 KV must pass separately on H100 and B200. FlashInfer 0.6.14 has
-  no upstream sink+FP8 qualification.
+  no upstream sink+FP8 qualification, and its current prefill chunk is quantized
+  before attention rather than retained in BF16 like Triton.
 - TP 4/8 and the production DP/PP topology still need the per-rank sink checksum
   test; the provided H100/B200 matrix covers TP 1/2.
 - Non-unit FP8 K/V scales are covered directly; their full-server FP8-E4M3 path

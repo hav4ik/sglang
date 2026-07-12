@@ -225,7 +225,10 @@ done
 done
 
 if [ "$PROFILE" = rl ] && [ "${RUN_LIVE_SINK_UPDATE:-1}" = 1 ]; then
-  for quantization in ${LIVE_QUANTIZATIONS:-fp8}; do
+  # Sink-only tensor transfer exercises OLMo's ordinary TP loader. FlashRL
+  # intentionally requires a complete checkpoint, so its production path is the
+  # full A -> B -> A disk cycle above rather than this partial diagnostic.
+  for quantization in ${LIVE_QUANTIZATIONS:-none}; do
   for kv_cache_dtype in ${LIVE_KV_CACHE_DTYPES:-auto}; do
   for backend in $BACKENDS; do
     "$PYTHON" scripts/attention_sink/validate_live_sink_update.py \

@@ -53,6 +53,15 @@ def require_update_success(result, operation):
     return {"success": bool(result[0]), "message": str(result[1])}
 
 
+def validate_live_update_quantization(quantization: str) -> None:
+    if quantization == "fp8":
+        raise ValueError(
+            "sink-only tensor updates cannot use the transactional FlashRL loader; "
+            "run with --quantization none and qualify FP8 with the complete "
+            "A -> B -> A disk-reload cycle"
+        )
+
+
 def sink_checksums(engine, expected_ranks, expected_sinks):
     from sglang.srt.managers.io_struct import CheckWeightsReqInput
 
@@ -95,6 +104,8 @@ def main():
     parser.add_argument("--mem-fraction-static", type=float, default=0.8)
     parser.add_argument("--logprob-atol", type=float, default=5e-2)
     args = parser.parse_args()
+
+    validate_live_update_quantization(args.quantization)
 
     config = json.loads((Path(args.model) / "config.json").read_text())
     layers = int(config["num_hidden_layers"])
