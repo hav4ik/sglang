@@ -7,6 +7,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SGLANG_CHECKOUT=/workspace/sglang \
     FLASHINFER_CACHE_DIR=/cache/flashinfer \
     TRITON_CACHE_DIR=/cache/triton \
+    UV_SYSTEM_PYTHON=1 \
+    UV_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Keep generic CUDA config packages at 12.8 as well. NVIDIA's mutable apt
