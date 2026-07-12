@@ -27,16 +27,10 @@ docker buildx create --name "$BUILDER" --driver docker-container --use >/dev/nul
 docker buildx inspect --bootstrap >/dev/null
 docker buildx build "$ROOT" \
   --builder "$BUILDER" \
-  --file "$ROOT/docker/Dockerfile" \
+  --file "$ROOT/docker/Dockerfile.attention-sink-cu128" \
   --platform linux/amd64 \
-  --target attention_sink_dev \
-  --build-arg CUDA_VERSION=12.8.1 \
-  --build-arg BRANCH_TYPE=local \
-  --build-arg BUILD_TYPE=checkpoint-engine \
-  --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-  --build-arg BUILD_AND_DOWNLOAD_PARALLEL=4 \
-  --build-arg SGLANG_BUILD_COMMIT="$REVISION" \
-  --build-arg SGLANG_IMAGE_TAG="$IMAGE" \
+  --label org.opencontainers.image.revision="$REVISION" \
+  --label org.opencontainers.image.source="https://github.com/hav4ik/sglang" \
   --tag "$IMAGE" \
   --tag "$REVISION_TAG" \
   --progress plain \

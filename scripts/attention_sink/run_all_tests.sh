@@ -9,6 +9,8 @@ if [ ! -d "$CHECKOUT/.git" ]; then
   exit 1
 fi
 
+sglang-sink-check-cuda
+
 cd "$CHECKOUT"
 export PROFILE=kernel
 export PYTHON

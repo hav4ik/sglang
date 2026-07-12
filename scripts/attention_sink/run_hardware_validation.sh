@@ -8,6 +8,13 @@ PROFILE="${PROFILE:-kernel}"
 mkdir -p "$RESULTS"
 cd "$ROOT"
 
+if command -v sglang-sink-check-cuda >/dev/null 2>&1; then
+  sglang-sink-check-cuda | tee "$RESULTS/cuda-12.8-gate.json"
+else
+  "$PYTHON" scripts/attention_sink/check_cuda_128.py \
+    | tee "$RESULTS/cuda-12.8-gate.json"
+fi
+
 nvidia-smi -q >"$RESULTS/nvidia-smi.txt"
 git rev-parse HEAD >"$RESULTS/git-revision.txt"
 git status --short >"$RESULTS/git-status.txt"

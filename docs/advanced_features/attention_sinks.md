@@ -121,12 +121,19 @@ docker run --rm -it --gpus all --ipc=host \
   -v "$PWD/cache:/cache" -v "$PWD/workspace:/workspace" \
   chankhavu/proofpilot-sglang-sink:flashinfer-sink-cu128
 sglang-sink-bootstrap
+sglang-sink-check-cuda
 sglang-sink-tests
 ```
 
 `sglang-sink-bootstrap` compiles only the small Rust gRPC extension. The first
 test run may JIT architecture-specific FlashInfer and Triton CUDA kernels into
 the mounted `/cache`; subsequent runs reuse that cache.
+`sglang-sink-check-cuda` fails on nvcc, libcudart, Torch, native wheel tags,
+Debian packages, or filesystem toolkits newer than CUDA 12.8. It reports but
+allows `cuda-python`/`cuda-bindings` 12.9.4 because they are Python API wrappers
+required by Torch's cu128 wheel, not toolkit/runtime libraries. The driver
+version shown by `nvidia-smi` is also informational because it describes host
+compatibility rather than the container toolkit.
 
 Use a fresh environment containing this exact checkout and its pinned FlashInfer:
 

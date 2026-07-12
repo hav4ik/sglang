@@ -7,6 +7,8 @@ CHECKOUT="${SGLANG_CHECKOUT:-/workspace/sglang}"
 PYTHON="${PYTHON:-python3}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/sglang-cargo-target}"
 
+sglang-sink-check-cuda
+
 if [ -e "$CHECKOUT" ] && [ ! -d "$CHECKOUT/.git" ]; then
   echo "ERROR: $CHECKOUT exists but is not a git checkout" >&2
   exit 1
@@ -60,6 +62,8 @@ print("editable checkout ready", source)
 print("torch", torch.__version__, "CUDA", torch.version.cuda)
 print("flashinfer", md.version("flashinfer-python"))
 PY
+
+sglang-sink-check-cuda
 
 rm -rf "$CARGO_TARGET_DIR"
 trap - EXIT

@@ -802,8 +802,9 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     perftest \
     # Build tools for JIT compilation
     ninja-build \
-    # The CUDA devel base already supplies matching NCCL runtime/dev packages.
-    # Reinstalling unpinned names can upgrade a cu12 image to CUDA-13 NCCL.
+    # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
+    libnccl2 \
+    libnccl-dev \
     # GPG key verification
     gnupg2 \
     linux-libc-dev \
@@ -883,61 +884,4 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
 # Default command
-CMD ["/bin/bash"]
-
-########################################################
-########## Attention-Sink Validation Image ############
-########################################################
-# CUDA kernels remain architecture-specific JIT artifacts. This target contains
-# the full compiler toolchain plus the small Rust/protobuf toolchain required by
-# a runtime `pip install -e python --no-deps`.
-FROM runtime AS attention_sink_dev
-
-ENV PATH="/root/.cargo/bin:${PATH}" \
-    SGLANG_CHECKOUT=/workspace/sglang \
-    FLASHINFER_CACHE_DIR=/cache/flashinfer \
-    TRITON_CACHE_DIR=/cache/triton
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        protobuf-compiler libprotobuf-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf \
-        https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
-    && python3 -m pip install --no-cache-dir \
-        pytest pytest-asyncio setuptools-rust setuptools-scm wheel \
-    && rustc --version \
-    && cargo --version
-
-RUN python3 - <<'PY'
-import importlib.metadata as md
-import re
-import subprocess
-
-import torch
-
-assert str(torch.version.cuda or "").startswith("12.8"), torch.version.cuda
-assert md.version("flashinfer-python") == "0.6.14"
-freeze = subprocess.check_output(
-    ["python3", "-m", "pip", "list", "--format=freeze"], text=True
-)
-cu13 = [
-    line
-    for line in freeze.splitlines()
-    if re.search(r"(cu13|cuda[-_]?13)", line.split("==", 1)[0], re.I)
-]
-assert not cu13, f"CUDA-13 Python packages found in cu128 image: {cu13}"
-PY
-RUN dpkg-query -W libnccl2 libnccl-dev | tee /tmp/nccl-packages.txt \
-    && ! grep -i 'cuda13' /tmp/nccl-packages.txt \
-    && rm /tmp/nccl-packages.txt
-
-COPY --chmod=755 scripts/attention_sink/bootstrap_checkout.sh \
-    /usr/local/bin/sglang-sink-bootstrap
-COPY --chmod=755 scripts/attention_sink/run_all_tests.sh \
-    /usr/local/bin/sglang-sink-tests
-
-RUN mkdir -p /workspace /cache/flashinfer /cache/triton \
-    && chmod -R 777 /cache
-
-WORKDIR /workspace
 CMD ["/bin/bash"]
