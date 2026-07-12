@@ -59,12 +59,18 @@ RUN uv pip install --python /usr/bin/python --no-cache \
         pytest pytest-asyncio scikit-build-core setuptools setuptools-rust \
         setuptools-scm wheel
 
-# Build SGLang's native kernel wheel with this image's nvcc 12.8. No cu129
-# artifact is accepted in this image.
-RUN CMAKE_ARGS="-DENABLE_BELOW_SM90=OFF -DSGL_KERNEL_COMPILE_THREADS=1" \
-    CMAKE_BUILD_PARALLEL_LEVEL=2 \
-    uv pip install --python /usr/bin/python --no-cache \
-        --no-build-isolation --no-deps ./sgl-kernel
+# SGLang does not publish a cu128 wheel for kernel 0.4.4. This official cu129
+# wheel contains native sm90/sm120a cubins, no PTX, and links CUDA 12.x SONAMEs.
+# Install it without dependencies so the image keeps the cu128 runtime stack.
+ARG SGL_KERNEL_WHEEL_SHA256=4ea2f7176965c3d1a5697254befe45c2ac995793577108129710d0f66ca85b33
+RUN curl -fL --retry 3 \
+        -o /tmp/sglang_kernel-0.4.4+cu129-cp310-abi3-manylinux2014_x86_64.whl \
+        https://github.com/sgl-project/whl/releases/download/v0.4.4/sglang_kernel-0.4.4+cu129-cp310-abi3-manylinux2014_x86_64.whl \
+    && echo "${SGL_KERNEL_WHEEL_SHA256}  /tmp/sglang_kernel-0.4.4+cu129-cp310-abi3-manylinux2014_x86_64.whl" \
+        | sha256sum -c - \
+    && uv pip install --python /usr/bin/python --no-cache --no-deps \
+        /tmp/sglang_kernel-0.4.4+cu129-cp310-abi3-manylinux2014_x86_64.whl \
+    && rm -f /tmp/sglang_kernel-0.4.4+cu129-cp310-abi3-manylinux2014_x86_64.whl
 
 # Install the candidate once so the image is immediately usable. Runtime
 # bootstrap performs the same quick Rust-only editable build after cloning.

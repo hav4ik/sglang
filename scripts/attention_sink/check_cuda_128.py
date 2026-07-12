@@ -14,6 +14,7 @@ from packaging.version import Version
 
 
 MAX_CUDA = Version("12.8")
+NATIVE_BINARY_EXCEPTIONS = {"sglang-kernel": "0.4.4+cu129"}
 
 
 def command(*args):
@@ -74,12 +75,24 @@ def main():
     api_binding_packages = {"cuda-python", "cuda-bindings"}
     operational_cuda_packages = {"cuda-core", "cuda-toolkit"}
     package_report = {}
+    native_binary_report = {}
     for dist in md.distributions():
         name = (dist.metadata.get("Name") or "").lower()
         version = dist.version
         if not name:
             continue
-        if re.search(r"cu(?:129|13\d)|cuda[-_]?(?:12[._-]?9|13)", name):
+        newer_tag = re.search(
+            r"cu(?:129|13\d)|cuda[-_]?(?:12[._-]?9|13)",
+            f"{name}=={version}",
+        )
+        expected_exception = NATIVE_BINARY_EXCEPTIONS.get(name)
+        if expected_exception:
+            native_binary_report[name] = version
+            if version != expected_exception:
+                errors.append(
+                    f"{name} must be the audited {expected_exception} wheel, got {version}"
+                )
+        elif newer_tag:
             errors.append(f"newer CUDA package tag is forbidden: {name}=={version}")
         if name in api_binding_packages | operational_cuda_packages:
             package_report[name] = version
@@ -88,6 +101,12 @@ def main():
             if parsed and parsed > MAX_CUDA:
                 errors.append(f"{name} must be <=12.8, got {version}")
     report["cuda_python_api_packages"] = package_report
+    report["native_cuda_binary_exceptions"] = native_binary_report
+    for name, expected in NATIVE_BINARY_EXCEPTIONS.items():
+        if name not in native_binary_report:
+            errors.append(
+                f"required audited native wheel is missing: {name}=={expected}"
+            )
 
     if shutil.which("dpkg-query"):
         packages = command("dpkg-query", "-W", "-f=${Package}\t${Version}\n")

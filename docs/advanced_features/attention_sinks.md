@@ -131,9 +131,12 @@ the mounted `/cache`; subsequent runs reuse that cache.
 `sglang-sink-check-cuda` fails on nvcc, libcudart, Torch, native wheel tags,
 Debian packages, or filesystem toolkits newer than CUDA 12.8. It reports but
 allows `cuda-python`/`cuda-bindings` 12.9.4 because they are Python API wrappers
-required by Torch's cu128 wheel, not toolkit/runtime libraries. The driver
-version shown by `nvidia-smi` is also informational because it describes host
-compatibility rather than the container toolkit.
+required by Torch's cu128 wheel, not toolkit/runtime libraries. It also permits
+only the checksum-pinned `sglang-kernel==0.4.4+cu129` native-wheel exception.
+That wheel contains sm90/sm120a cubins without PTX and resolves against the
+image's CUDA 12.8 runtime libraries. The driver version shown by `nvidia-smi` is
+informational because it describes host compatibility rather than the container
+toolkit.
 
 Use a fresh environment containing this exact checkout and its pinned FlashInfer:
 
