@@ -2222,6 +2222,8 @@ class FlashInferIndicesUpdaterPrefill:
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
 
+        # Supported sink models are decoder-only. Match plan-time scheduling to
+        # the causal mask selected again when the wrapper runs.
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -2233,6 +2235,7 @@ class FlashInferIndicesUpdaterPrefill:
             1,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
+            causal=self.attn_backend.has_attention_sinks,
             custom_mask=use_custom_mask,
             window_left=getattr(wrapper_paged, "_sglang_sink_window_left", -1),
             non_blocking=True,

@@ -57,7 +57,7 @@ def paged_kv(k, v):
     )
 
 
-def flashinfer_attention(q, k, v, sinks, window_left):
+def flashinfer_attention(q, k, v, sinks, window_left, *, k_scale=None, v_scale=None):
     batch_size, _, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[2]
     kv_cache, kv_indptr, kv_indices, last_page_len = paged_kv(k, v)
@@ -102,6 +102,8 @@ def flashinfer_attention(q, k, v, sinks, window_left):
         causal=True,
         sm_scale=head_dim**-0.5,
         window_left=window_left,
+        k_scale=k_scale,
+        v_scale=v_scale,
     ).view_as(q)
 
 
@@ -167,7 +169,7 @@ def triton_extend_attention(q, k, v, sinks, window_left):
     return output.view_as(q)
 
 
-def triton_decode_attention(q, k, v, sinks, window_left):
+def triton_decode_attention(q, k, v, sinks, window_left, *, k_scale=1.0, v_scale=1.0):
     batch_size, seq_len, _, head_dim = k.shape
     num_q_heads = q.shape[2]
     k_buffer = k.flatten(0, 1).contiguous()
@@ -223,8 +225,8 @@ def triton_decode_attention(q, k, v, sinks, window_left):
         num_kv_splits,
         max_kv_splits,
         head_dim**-0.5,
-        1.0,
-        1.0,
+        k_scale,
+        v_scale,
         sinks=sinks,
     )
     return output[:, None]

@@ -232,6 +232,7 @@ def test_sink_prefill_indices_updater_reads_backend_flag():
         )
 
     assert wrapper.begin_forward_kwargs["custom_mask"] is None
+    assert wrapper.begin_forward_kwargs["causal"] is True
     assert wrapper.begin_forward_kwargs["window_left"] == 32
 
 

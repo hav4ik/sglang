@@ -30,10 +30,15 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="4-gpu-b200")
 )
 @pytest.mark.parametrize("window_left", [-1, 4])
 @pytest.mark.parametrize(
+    "sink_value",
+    [None, 13.6875, 21.75],
+    ids=["random", "checkpoint-max", "variant-max"],
+)
+@pytest.mark.parametrize(
     "kv_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16-kv", "fp8-kv"]
 )
 def test_flashinfer_and_triton_attention_sinks_match_eager(
-    mode, extend_len, window_left, kv_dtype
+    mode, extend_len, window_left, sink_value, kv_dtype
 ):
     torch.manual_seed(0)
     device = "cuda"
@@ -51,7 +56,11 @@ def test_flashinfer_and_triton_attention_sinks_match_eager(
     q = torch.randn(
         batch_size, extend_len, num_q_heads, head_dim, device=device, dtype=dtype
     )
-    sinks = torch.randn(num_q_heads, device=device, dtype=dtype)
+    sinks = (
+        torch.randn(num_q_heads, device=device, dtype=dtype)
+        if sink_value is None
+        else torch.full((num_q_heads,), sink_value, device=device, dtype=torch.float32)
+    )
 
     flashinfer_out = flashinfer_attention(q, k, v, sinks, window_left)
     expected = eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
@@ -73,6 +82,77 @@ def test_flashinfer_and_triton_attention_sinks_match_eager(
         triton_out.float(),
         rtol=tolerance,
         atol=tolerance,
+    )
+
+
+@pytest.mark.parametrize("window_left", [-1, 4])
+def test_fp8_kv_attention_sinks_apply_nonunit_scales(window_left):
+    torch.manual_seed(2)
+    device = "cuda"
+    if torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("E4M3 KV kernels require sm89 or newer")
+
+    batch_size, seq_len, num_q_heads, num_kv_heads, head_dim = 2, 16, 40, 8, 128
+    q = torch.randn(
+        batch_size, 1, num_q_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    k_scale, v_scale = 0.25, 1.75
+    k_cache = (
+        torch.randn(
+            batch_size,
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        ).float()
+        / k_scale
+    ).to(torch.float8_e4m3fn)
+    v_cache = (
+        torch.randn(
+            batch_size,
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        ).float()
+        / v_scale
+    ).to(torch.float8_e4m3fn)
+    sinks = torch.linspace(
+        -0.30859375, 13.6875, num_q_heads, device=device, dtype=torch.float32
+    )
+    expected = eager_reference(
+        q,
+        k_cache.float() * k_scale,
+        v_cache.float() * v_scale,
+        sinks,
+        causal=True,
+        window_left=window_left,
+    )
+    flashinfer_out = flashinfer_attention(
+        q,
+        k_cache,
+        v_cache,
+        sinks,
+        window_left,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    triton_out = triton_decode_attention(
+        q,
+        k_cache,
+        v_cache,
+        sinks,
+        window_left,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+    torch.testing.assert_close(flashinfer_out.float(), expected, rtol=0.08, atol=0.08)
+    torch.testing.assert_close(triton_out.float(), expected, rtol=0.08, atol=0.08)
+    torch.testing.assert_close(
+        flashinfer_out.float(), triton_out.float(), rtol=0.08, atol=0.08
     )
 
 
