@@ -202,7 +202,11 @@ PY
       probe_args+=(--require-reload-change)
     fi
   fi
-  "$PYTHON" scripts/attention_sink/probe_server.py "${probe_args[@]}"
+  if ! "$PYTHON" scripts/attention_sink/probe_server.py "${probe_args[@]}"; then
+    echo "probe failed; last 250 lines from $log:" >&2
+    tail -250 "$log" >&2 || true
+    exit 1
+  fi
   cleanup_server
   trap - EXIT
 done
