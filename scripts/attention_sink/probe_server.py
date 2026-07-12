@@ -2,6 +2,8 @@
 """Probe a running sink-model server and optionally exercise disk reloads."""
 
 import argparse
+import concurrent.futures
+import hashlib
 import json
 import math
 import time
@@ -39,6 +41,29 @@ def validate_generation_result(result, prompt_length):
         )
 
 
+def get_loads(url, timeout):
+    response = requests.get(f"{url}/v1/loads?include=core", timeout=timeout)
+    response.raise_for_status()
+    body = response.json()
+    loads = body.get("loads") or []
+    if not loads:
+        raise RuntimeError("/v1/loads returned no scheduler load snapshots")
+    return loads
+
+
+def wait_for_running_request(url, future, timeout):
+    deadline = time.monotonic() + min(timeout, 60.0)
+    while time.monotonic() < deadline:
+        if future.done():
+            future.result()
+            raise RuntimeError("in-flight probe completed before the weight update")
+        loads = get_loads(url, min(timeout, 10.0))
+        if any(int(load.get("num_running_reqs", 0)) > 0 for load in loads):
+            return loads
+        time.sleep(0.05)
+    raise TimeoutError("in-flight probe never appeared in scheduler load metrics")
+
+
 def probe(url, model, lengths, output_tokens, timeout):
     results = []
     for length in lengths:
@@ -69,22 +94,122 @@ def probe(url, model, lengths, output_tokens, timeout):
 
 
 def reload(url, model_path, version, timeout, load_format):
-    post(url, "/pause_generation", {"mode": "abort"}, timeout)
+    post(url, "/pause_generation", {"mode": "in_place"}, timeout)
+    result = update_weights(url, model_path, version, timeout, load_format)
+    post(url, "/continue_generation", {}, timeout)
+    return result
+
+
+def update_weights(url, model_path, version, timeout, load_format):
     result = post(
         url,
         "/update_weights_from_disk",
         {
             "model_path": model_path,
             "weight_version": str(version),
-            "flush_cache": True,
+            "flush_cache": False,
             "load_format": load_format,
         },
         timeout,
     )
     if not result.get("success", False):
         raise RuntimeError(f"reload rejected: {result}")
-    post(url, "/continue_generation", {}, timeout)
     return result
+
+
+def summarize_loads(loads):
+    return {
+        "num_running_reqs": sum(int(load.get("num_running_reqs", 0)) for load in loads),
+        "num_waiting_reqs": sum(int(load.get("num_waiting_reqs", 0)) for load in loads),
+        "num_used_tokens": sum(int(load.get("num_used_tokens", 0)) for load in loads),
+    }
+
+
+def require_active_kv(loads, phase, minimum_used_tokens=1):
+    summary = summarize_loads(loads)
+    if summary["num_running_reqs"] < 1:
+        raise RuntimeError(f"in-flight request disappeared {phase}: {summary}")
+    if summary["num_used_tokens"] < minimum_used_tokens:
+        raise RuntimeError(f"in-flight KV disappeared {phase}: {summary}")
+    return summary
+
+
+def require_flush_blocked_by_active_request(url, timeout):
+    response = requests.post(f"{url}/flush_cache?timeout=0", timeout=timeout)
+    if response.status_code != 400:
+        raise RuntimeError(
+            "flush_cache unexpectedly succeeded while the in-flight request "
+            f"was paused: status={response.status_code} body={response.text!r}"
+        )
+    return {"status_code": response.status_code, "body": response.text}
+
+
+def reload_with_inflight_request(
+    url, model_path, version, timeout, load_format, output_tokens
+):
+    payload = {
+        "input_ids": [42] * 128,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": output_tokens,
+            "ignore_eos": True,
+        },
+    }
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(post, url, "/generate", payload, timeout)
+    paused = False
+    continued = False
+    try:
+        loads_before_reload = wait_for_running_request(url, future, timeout)
+        post(url, "/pause_generation", {"mode": "in_place"}, timeout)
+        paused = True
+        loads_while_paused = get_loads(url, min(timeout, 10.0))
+        paused_summary = require_active_kv(
+            loads_while_paused, "while paused", minimum_used_tokens=128
+        )
+        blocked_flush = require_flush_blocked_by_active_request(url, min(timeout, 10.0))
+        reload_result = update_weights(url, model_path, version, timeout, load_format)
+        loads_after_reload = get_loads(url, min(timeout, 10.0))
+        after_summary = require_active_kv(
+            loads_after_reload,
+            "after no-flush reload",
+            minimum_used_tokens=paused_summary["num_used_tokens"],
+        )
+        post(url, "/continue_generation", {}, timeout)
+        continued = True
+        generation_result = future.result(timeout=timeout)
+    finally:
+        if paused and not continued:
+            try:
+                post(url, "/continue_generation", {}, min(timeout, 10.0))
+            except Exception:
+                pass
+        executor.shutdown(wait=future.done(), cancel_futures=True)
+
+    output_ids = generation_result.get("output_ids") or []
+    if len(output_ids) != output_tokens:
+        raise RuntimeError(
+            "in-flight probe did not survive the update: "
+            f"expected {output_tokens} output IDs, got {len(output_ids)}"
+        )
+    output_sha256 = hashlib.sha256(
+        json.dumps(output_ids, separators=(",", ":")).encode()
+    ).hexdigest()
+    return reload_result, {
+        "loads_before_reload": loads_before_reload,
+        "loads_while_paused": loads_while_paused,
+        "loads_after_reload": loads_after_reload,
+        "paused_summary": paused_summary,
+        "after_reload_summary": after_summary,
+        "blocked_flush": blocked_flush,
+        "output_count": len(output_ids),
+        "output_prefix": output_ids[:8],
+        "output_suffix": output_ids[-8:],
+        "output_sha256": output_sha256,
+        "finish_reason": (generation_result.get("meta_info") or {}).get(
+            "finish_reason"
+        ),
+    }
 
 
 def get_sink_checksums(url, timeout, expected_count):
@@ -214,6 +339,7 @@ def main():
     parser.add_argument("--logprob-atol", type=float, default=5e-2)
     parser.add_argument("--require-reload-change", action="store_true")
     parser.add_argument("--reload-change-min-logprob", type=float, default=1e-4)
+    parser.add_argument("--inflight-output-tokens", type=int, default=0)
     args = parser.parse_args()
 
     lengths = [int(value) for value in args.lengths.split(",") if value]
@@ -246,13 +372,26 @@ def main():
             change_error = None
             restore_error = None
             try:
-                report["reload_to_b"] = reload(
-                    args.url,
-                    args.reload_model,
-                    1,
-                    args.timeout,
-                    args.reload_load_format,
-                )
+                if args.inflight_output_tokens:
+                    (
+                        report["reload_to_b"],
+                        report["inflight_b_reload"],
+                    ) = reload_with_inflight_request(
+                        args.url,
+                        args.reload_model,
+                        1,
+                        args.timeout,
+                        args.reload_load_format,
+                        args.inflight_output_tokens,
+                    )
+                else:
+                    report["reload_to_b"] = reload(
+                        args.url,
+                        args.reload_model,
+                        1,
+                        args.timeout,
+                        args.reload_load_format,
+                    )
                 report["after_b"] = probe(
                     args.url,
                     args.reload_model,

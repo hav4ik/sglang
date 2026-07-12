@@ -240,6 +240,16 @@ loader, which slices a distinct range on every TP rank. It does not use FlashRL,
 because the transactional FlashRL loader requires a complete 771-weight
 checkpoint. The FP8 A -> B -> A cycle above is the full-checkpoint FlashRL test.
 
+Reload probes use `pause_generation(mode="in_place")`, update with
+`flush_cache=False`, and then continue generation. This is the AsyncRL hot-swap
+contract: scheduler forwards are quiesced during mutation, and active-request KV
+is retained. An active request can therefore resume with KV produced by the old
+weights and generate later tokens with the new weights. This is not per-request
+model-version isolation. The validation server disables radix caching so a new
+request cannot reuse another request's old-version prefix KV; deployments that
+retain shared prefix caches need model-versioned cache entries or an explicit
+invalidation policy.
+
 Recommended hardware allocation:
 
 | Qualification | H100 | B200 |
@@ -266,6 +276,8 @@ Acceptance criteria:
 - A -> B -> A reproduces A's output IDs and logprobs.
 - Every TP rank reports 64 sink checksums, updated shards are rank-distinct, and
   restore reproduces the original per-engine sink checksum exactly.
+- A request observed as running before an in-place update completes all requested
+  decode tokens after the no-flush update resumes generation.
 - Cold head-dimension-128 FlashInfer JIT succeeds in an offline B200 container.
 
 ## Remaining Gaps
@@ -280,11 +292,13 @@ Acceptance criteria:
 - Injected mid-commit GPU failure and single-TP-rank failure need fail-stop tests.
 - Cold-start and FlashRL FP8 quantization of row-parallel projections should be
   aligned so the initial policy is independent of whether it came through reload.
-- Concurrent generation must be aborted/retried during reload without admitting a
-  mixed-version trajectory.
+- In-place, no-flush reload intentionally admits mixed-version trajectories for
+  active requests. The integration test proves request survival with radix
+  disabled; shared radix KV is not yet versioned across policy updates.
 - The production image must install this fork, pass dependency checks, cold-build
   the JIT offline, and restart from a warm cache.
-- Radix-cache update behavior is not qualified; OPD disables radix and flushes KV.
+- Radix-cache update behavior is not qualified; current AsyncRL validation disables
+  radix while preserving active-request KV.
 - Full-model 128K prefill is a separate expensive test. Kernel tests reach 128K
   decode and cached extend.
 - Speculative decoding is deferred because Yi-Chia's sink-bearing DFlash draft is
