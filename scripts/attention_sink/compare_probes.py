@@ -70,12 +70,11 @@ def main():
     args = parser.parse_args()
     triton_report = json.loads(Path(args.triton).read_text())
     flashinfer_report = json.loads(Path(args.flashinfer).read_text())
-    print(
-        json.dumps(
-            compare_probe_reports(triton_report, flashinfer_report, args.logprob_atol),
-            indent=2,
-        )
+    comparison = compare_probe_reports(
+        triton_report, flashinfer_report, args.logprob_atol
     )
+    comparison["_metadata"] = {"logprob_atol": args.logprob_atol}
+    print(json.dumps(comparison, indent=2))
 
 
 if __name__ == "__main__":
