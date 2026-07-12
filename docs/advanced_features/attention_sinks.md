@@ -5,6 +5,8 @@ attention-sink logit per query head. The target artifact is
 `chankhavu/yccchen-olmo3-deploy` (`Olmo3SinkForCausalLM`). Yi-Chia Chen's Triton
 path remains the rollout default; FlashInfer is an explicit, release-gated option.
 The audited model revision is `39beac79e6857df6d8a0dc27210f5affa4031c92`.
+The complete implementation and qualification record is maintained in
+[attention_sinks_audit.md](attention_sinks_audit.md).
 
 ## Semantics
 
