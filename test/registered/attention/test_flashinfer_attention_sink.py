@@ -35,10 +35,21 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="4-gpu-b200")
     ids=["random", "checkpoint-max", "variant-max"],
 )
 @pytest.mark.parametrize(
+    "num_q_heads,num_kv_heads",
+    [(40, 8), (20, 4)],
+    ids=["tp1-heads", "tp2-heads"],
+)
+@pytest.mark.parametrize(
     "kv_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16-kv", "fp8-kv"]
 )
 def test_flashinfer_and_triton_attention_sinks_match_eager(
-    mode, extend_len, window_left, sink_value, kv_dtype
+    mode,
+    extend_len,
+    window_left,
+    sink_value,
+    num_q_heads,
+    num_kv_heads,
+    kv_dtype,
 ):
     torch.manual_seed(0)
     device = "cuda"
@@ -46,7 +57,7 @@ def test_flashinfer_and_triton_attention_sinks_match_eager(
     if kv_dtype == torch.float8_e4m3fn and torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("E4M3 KV kernels require sm89 or newer")
 
-    batch_size, seq_len, num_q_heads, num_kv_heads, head_dim = 2, 16, 40, 8, 128
+    batch_size, seq_len, head_dim = 2, 16, 128
     k = torch.randn(
         batch_size, seq_len, num_kv_heads, head_dim, device=device, dtype=dtype
     ).to(kv_dtype)
@@ -86,13 +97,20 @@ def test_flashinfer_and_triton_attention_sinks_match_eager(
 
 
 @pytest.mark.parametrize("window_left", [-1, 4])
-def test_fp8_kv_attention_sinks_apply_nonunit_scales(window_left):
+@pytest.mark.parametrize(
+    "num_q_heads,num_kv_heads",
+    [(40, 8), (20, 4)],
+    ids=["tp1-heads", "tp2-heads"],
+)
+def test_fp8_kv_attention_sinks_apply_nonunit_scales(
+    window_left, num_q_heads, num_kv_heads
+):
     torch.manual_seed(2)
     device = "cuda"
     if torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("E4M3 KV kernels require sm89 or newer")
 
-    batch_size, seq_len, num_q_heads, num_kv_heads, head_dim = 2, 16, 40, 8, 128
+    batch_size, seq_len, head_dim = 2, 16, 128
     q = torch.randn(
         batch_size, 1, num_q_heads, head_dim, device=device, dtype=torch.bfloat16
     )
@@ -159,16 +177,21 @@ def test_fp8_kv_attention_sinks_apply_nonunit_scales(window_left):
 @pytest.mark.parametrize("window_left", [-1, 4])
 @pytest.mark.parametrize("batch_size", [1, 2, 8])
 @pytest.mark.parametrize(
+    "num_q_heads,num_kv_heads",
+    [(40, 8), (20, 4)],
+    ids=["tp1-heads", "tp2-heads"],
+)
+@pytest.mark.parametrize(
     "kv_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16-kv", "fp8-kv"]
 )
 def test_flashinfer_attention_sinks_cuda_graph_reads_reloaded_values(
-    window_left, batch_size, kv_dtype
+    window_left, batch_size, num_q_heads, num_kv_heads, kv_dtype
 ):
     torch.manual_seed(1)
     device, dtype = "cuda", torch.bfloat16
     if kv_dtype == torch.float8_e4m3fn and torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("E4M3 KV kernels require sm89 or newer")
-    seq_len, num_q_heads, num_kv_heads, head_dim = 16, 40, 8, 128
+    seq_len, head_dim = 16, 128
     q = torch.randn(batch_size, 1, num_q_heads, head_dim, device=device, dtype=dtype)
     k = torch.randn(
         batch_size, seq_len, num_kv_heads, head_dim, device=device, dtype=dtype

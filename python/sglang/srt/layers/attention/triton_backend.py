@@ -655,12 +655,12 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_kv_indices[:n_kv] = self._translate_kv_loc(
                 self.cuda_graph_kv_indices[:n_kv]
             )
-        # SWA window read path. window_kv_indptr[bs] == sum(min(seq_len, window)).
+        # SWA window includes the current token and window preceding positions.
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if have_cpu_mirror:
                 n_win = int(
                     forward_batch.seq_lens_cpu[:bs]
-                    .clamp(max=self.sliding_window_size)
+                    .clamp(max=self.sliding_window_size + 1)
                     .sum()
                 )
             else:
@@ -983,7 +983,7 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indices_buf is None:
                 self.cuda_graph_window_kv_indices = torch.zeros(
-                    (max_num_tokens * self.sliding_window_size),
+                    (max_num_tokens * (self.sliding_window_size + 1)),
                     dtype=torch.int64,
                     device=self.device,
                 )
@@ -1980,10 +1980,9 @@ def update_sliding_window_buffer(
     the live v2p and rewrites the static window buffer to swa-physical in place;
     baseline SWA leaves it False (eager).
     """
-    window_kv_lens = torch.minimum(
-        seq_lens,
-        torch.tensor(sliding_window_size),
-    )
+    # ``sliding_window_size`` is window_left: retain that many predecessors plus
+    # the current token, matching extend masking and FlashInfer metadata.
+    window_kv_lens = torch.clamp(seq_lens, max=sliding_window_size + 1)
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
     if window_kv_indices is None:

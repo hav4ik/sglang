@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferIndicesUpdaterPrefill,
     SGLangBatchAttentionWithAttentionSinkWrapper,
     _run_flashinfer_paged_with_sinks,
+    _validate_attention_sink_page_size,
 )
 from sglang.srt.models.olmo2 import get_olmo_rope_theta
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -78,6 +79,13 @@ def test_flashinfer_sink_jit_requires_float32_sinks():
             sinks=torch.randn(4, dtype=torch.bfloat16),
             window_left=32,
         )
+
+
+def test_flashinfer_sink_requires_page_size_one():
+    _validate_attention_sink_page_size(True, 1)
+    _validate_attention_sink_page_size(False, 16)
+    with pytest.raises(ValueError, match="require page size 1"):
+        _validate_attention_sink_page_size(True, 16)
 
 
 def test_sink_jit_cache_identity_includes_kv_dtype():

@@ -88,20 +88,22 @@ Failures before commit restore all original parameter pointers. Commit consists 
 prevalidated copies into existing storage, but a device fault during commit cannot
 be rolled back; the server reports uncertain state and must remain paused.
 
-OPD uses this replica barrier:
+AsyncRL/OPD uses this replica barrier:
 
 ```text
 save and validate checkpoint
--> abort active generation on every replica
--> reload every replica with KV flush
+-> pause scheduler forwards in-place on every replica
+-> reload every replica without flushing active-request KV
 -> verify every response
 -> resume every replica
 -> advance the global version
 ```
 
-An aborted rollout retries the same prompt after the pause gate opens, so no
-trajectory spans a weight boundary. If any stage fails, the global version does
-not advance and paused replicas remain paused.
+Active requests can therefore span a weight boundary: their existing KV was
+produced by the old weights and their resumed decode uses the new weights. If any
+stage fails, the global version does not advance and paused replicas remain
+paused. Per-request policy-version isolation requires versioned weights and KV;
+the in-place protocol intentionally does not provide it.
 
 FP8 qualification uses `cold A0 -> reload A1 -> reload B -> reload A2` and
 requires strict A1/A2 parity. Cold startup quantizes row-parallel weights after
@@ -240,6 +242,65 @@ loader, which slices a distinct range on every TP rank. It does not use FlashRL,
 because the transactional FlashRL loader requires a complete 771-weight
 checkpoint. The FP8 A -> B -> A cycle above is the full-checkpoint FlashRL test.
 
+### Backend divergence trace
+
+The fixed full-model backend gate is currently failing on H100 even though
+greedy tokens, reload parity, sink checksums, and direct kernel tests pass. With
+FP8 weights and BF16 KV, the largest observed output-token logprob delta is
+`0.217067` at prompt length 128. The BF16-weight control reaches `0.110017`, so
+the discrepancy is not isolated to FP8 weight conversion. Do not raise the
+`0.05` gate based on these observations.
+
+An audit also found that Triton decode retained only 4095 keys for OLMo's
+4096-token SWA window. Production metadata, CUDA-graph buffers, and the backend
+reference test now consistently retain the current token plus 4095 predecessors.
+That bug affects boundary and long-context probes but cannot explain the
+length-128 discrepancy, which is why the layer trace remains necessary.
+
+Capture the actual 128-token attention tensors from each backend using separate
+result and trace directories:
+
+```bash
+rm -rf /workspace/results/sink-trace-{triton,flashinfer}
+
+CUDA_VISIBLE_DEVICES=0,1 \
+SGLANG_ATTENTION_SINK_TRACE_DIR=/workspace/results/sink-trace-triton/tensors \
+SGLANG_ATTENTION_SINK_TRACE_TOKENS=128 \
+PROFILE=server TP=2 SKIP_KERNEL_TESTS=1 \
+MODEL=/models/yccchen-a BACKENDS=triton \
+QUANTIZATIONS=fp8 KV_CACHE_DTYPES=auto PROBE_LENGTHS=128 \
+PROBE_OUTPUT_TOKENS=1 CONTEXT_LEN=8192 MEMFRAC=0.55 \
+DISABLE_CUDA_GRAPH=1 \
+RESULTS=/workspace/results/sink-trace-triton \
+scripts/attention_sink/run_hardware_validation.sh
+
+CUDA_VISIBLE_DEVICES=0,1 \
+SGLANG_ATTENTION_SINK_TRACE_DIR=/workspace/results/sink-trace-flashinfer/tensors \
+SGLANG_ATTENTION_SINK_TRACE_TOKENS=128 \
+PROFILE=server TP=2 SKIP_KERNEL_TESTS=1 \
+MODEL=/models/yccchen-a BACKENDS=flashinfer \
+QUANTIZATIONS=fp8 KV_CACHE_DTYPES=auto PROBE_LENGTHS=128 \
+PROBE_OUTPUT_TOKENS=1 CONTEXT_LEN=8192 MEMFRAC=0.55 \
+DISABLE_CUDA_GRAPH=1 \
+RESULTS=/workspace/results/sink-trace-flashinfer \
+scripts/attention_sink/run_hardware_validation.sh
+
+CUDA_VISIBLE_DEVICES=0 python \
+  scripts/attention_sink/compare_attention_traces.py \
+  /workspace/results/sink-trace-triton/tensors \
+  /workspace/results/sink-trace-flashinfer/tensors \
+  --tp-rank 0 --replay-layer 0 \
+  | tee /workspace/results/sink-trace-rank0.json
+```
+
+Repeat the comparison with `--tp-rank 1`. The trace records Q, K, V, sinks, and
+the attention output for all 64 layers, about 200 MB per backend at TP=2. The
+comparison identifies where backend inputs first diverge and replays layer 0
+through eager, Triton, and FlashInfer using identical checkpoint activations.
+Tracing is disabled unless `SGLANG_ATTENTION_SINK_TRACE_DIR` is set. The trace
+run disables CUDA graphs so the real request executes the instrumented Python
+forward path; CUDA-graph behavior remains covered by the normal qualification.
+
 Reload probes use `pause_generation(mode="in_place")`, update with
 `flush_cache=False`, and then continue generation. This is the AsyncRL hot-swap
 contract: scheduler forwards are quiesced during mutation, and active-request KV
@@ -288,7 +349,8 @@ Acceptance criteria:
   no upstream sink+FP8 qualification.
 - TP 4/8 and the production DP/PP topology still need the per-rank sink checksum
   test; the provided H100/B200 matrix covers TP 1/2.
-- Non-unit FP8 K/V scales are not covered by the direct kernel fixture.
+- Non-unit FP8 K/V scales are covered directly; their full-server FP8-E4M3 path
+  still needs H100 and B200 qualification.
 - Injected mid-commit GPU failure and single-TP-rank failure need fail-stop tests.
 - Cold-start and FlashRL FP8 quantization of row-parallel projections should be
   aligned so the initial policy is independent of whether it came through reload.

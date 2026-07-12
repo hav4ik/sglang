@@ -19,7 +19,9 @@
 """Inference-only OLMo2/OLMo3-sink models compatible with HuggingFace weights."""
 
 import logging
+import os
 from functools import partial
+from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -88,6 +90,7 @@ class Olmo2Attention(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.tp_size = get_parallel().tp_size
         self.total_num_heads = config.num_attention_heads
@@ -176,6 +179,10 @@ class Olmo2Attention(nn.Module):
                     "OLMo3 attention sinks enabled "
                     f"(num_heads={self.num_heads}, dtype={sinks_dtype})"
                 )
+        self.sink_trace_dir = os.getenv("SGLANG_ATTENTION_SINK_TRACE_DIR")
+        self.sink_trace_tokens = int(
+            os.getenv("SGLANG_ATTENTION_SINK_TRACE_TOKENS", "128")
+        )
         self.scaling = self.head_dim**-0.5
         self.attn = RadixAttention(
             self.num_heads,
@@ -249,8 +256,52 @@ class Olmo2Attention(nn.Module):
             forward_batch,
             **({"sinks": self.sinks} if self.sinks is not None else {}),
         )
+        self._trace_sink_attention(positions, q, k, v, attn_output, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _trace_sink_attention(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_output: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if (
+            not self.sink_trace_dir
+            or self.sinks is None
+            or get_is_capture_mode()
+            or not forward_batch.forward_mode.is_extend()
+            or q.shape[0] != self.sink_trace_tokens
+        ):
+            return
+
+        trace_dir = Path(self.sink_trace_dir) / f"tp{self.tp_rank}"
+        trace_path = trace_dir / f"layer-{self.layer_id:02d}.pt"
+        if trace_path.exists():
+            return
+
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "layer_id": self.layer_id,
+            "tp_rank": self.tp_rank,
+            "num_q_heads": self.num_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+            "scaling": self.scaling,
+            "sliding_window_size": self.attn.sliding_window_size,
+            "positions": positions.detach().cpu(),
+            "q": q.detach().cpu(),
+            "k": k.detach().cpu(),
+            "v": v.detach().cpu(),
+            "sinks": self.sinks.detach().cpu(),
+            "attention_output": attn_output.detach().cpu(),
+        }
+        temporary_path = trace_path.with_suffix(".tmp")
+        torch.save(payload, temporary_path)
+        temporary_path.replace(trace_path)
 
 
 class Olmo2MLP(nn.Module):

@@ -35,22 +35,26 @@ DEFAULT_DEVICE = "cuda"
 DENSE_ATOL = 3e-2
 DENSE_RTOL = 3e-2
 
-# SWA decode rule classification — production metadata builders differ:
-#   - `min_seq_len_window` rule: `window_kv_lens = min(seq_lens, window)` (the
-#     extra current-token slot is NOT included; total = `window` keys).
-#   - `extend_window` rule: keys at `[query_pos - window, query_pos]` are
-#     allowed by the extend kernel mask (the current token IS included; total
-#     = `window + 1` keys). FlashInfer's SWA decode metadata uses
-#     `clamp(seq_lens, max=window + 1)` (`flashinfer_backend.py:1031`) which
-#     gives `window + 1` keys when `seq_len > window`, matching this rule.
-#     Within-window seqs collapse to `seq_len` in both rules, so cases that
-#     stay below the window can't distinguish them.
+# SWA decode rule classification. Correct backends use the `extend_window` rule:
+# keys at `[query_pos - window, query_pos]` are allowed, so the current token is
+# included and the total is `window + 1` keys. Keep the legacy set explicit so
+# any backend that intentionally differs must declare that behavior here.
+# Within-window sequences collapse to `seq_len` in both rules, so cases that
+# stay below the window cannot distinguish them.
 # Each known backend must be classified into exactly one set; an unclassified
 # backend trips `_swa_decode_uses_min_seq_len_rule` so a future SWA backend
 # can't silently inherit the wrong rule via a fallback.
-_SWA_DECODE_MIN_SEQ_LEN_WINDOW: frozenset[str] = frozenset({"triton"})
+_SWA_DECODE_MIN_SEQ_LEN_WINDOW: frozenset[str] = frozenset()
 _SWA_DECODE_EXTEND_WINDOW: frozenset[str] = frozenset(
-    {"torch_native", "fa3", "fa4", "flex_attention", "trtllm_mha", "flashinfer"}
+    {
+        "torch_native",
+        "fa3",
+        "fa4",
+        "flex_attention",
+        "trtllm_mha",
+        "flashinfer",
+        "triton",
+    }
 )
 
 
@@ -811,9 +815,9 @@ def _dense_attention_reference(
             query_pos = case.prefix_lens[req_idx] + offset
             key_start = 0
             if case.sliding_window_size is not None:
-                # Two SWA mask rules in production:
-                #   - extend kernel: `kv_id >= q_id - window` (window + 1 keys).
-                #   - SWA-aware decode metadata: `min(seq_lens, window)` keys.
+                # The correct mask includes the current token and `window`
+                # predecessors. The legacy branch remains explicit for any
+                # backend intentionally classified with the old convention.
                 if case.forward_mode.is_decode() and _swa_decode_uses_min_seq_len_rule(
                     case
                 ):

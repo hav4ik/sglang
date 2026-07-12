@@ -127,6 +127,9 @@ for backend in $BACKENDS; do
   if [ -n "${CUDA_GRAPH_MAX_BS_PREFILL:-}" ]; then
     cuda_graph_args+=(--cuda-graph-max-bs-prefill "$CUDA_GRAPH_MAX_BS_PREFILL")
   fi
+  if [ "${DISABLE_CUDA_GRAPH:-0}" = 1 ]; then
+    cuda_graph_args+=(--disable-cuda-graph)
+  fi
   if ! "$PYTHON" - "$PORT" <<'PY'
 import socket, sys
 s = socket.socket()

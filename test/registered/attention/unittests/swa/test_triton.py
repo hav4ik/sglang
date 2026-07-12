@@ -49,8 +49,8 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(1, 2, 3),
             sliding_window_size=4,
         ),
-        # Above-window decode exercises the `min(seq_lens, window)`
-        # clipping in the replay metadata builder.
+        # Above-window decode requires the current token plus `window`
+        # predecessors, matching the extend mask.
         DenseAttentionCase(
             name="runner_cuda_graph_swa_decode_above_window",
             backend="triton",
@@ -188,8 +188,8 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
             2,
             "eagle",
         ),
-        # Above-window verify exercises the `min(seq_lens, window)`
-        # clipping in the verify-path replay metadata builder.
+        # Above-window verify exercises the same inclusive window in the
+        # verify-path replay metadata builder.
         (
             DenseAttentionCase(
                 name="runner_cuda_graph_eagle_verify_swa_above_window",

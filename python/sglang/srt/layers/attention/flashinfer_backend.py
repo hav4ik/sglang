@@ -60,6 +60,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _validate_attention_sink_page_size(
+    has_attention_sinks: bool, page_size: int
+) -> None:
+    if has_attention_sinks and page_size != 1:
+        raise ValueError(
+            "FlashInfer attention-sink kernels require page size 1; "
+            f"got page size {page_size}"
+        )
+
+
 def _run_flashinfer_paged_with_sinks(
     wrapper,
     q: torch.Tensor,
@@ -471,6 +481,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.has_attention_sinks = model_runner.model_config.has_attention_sinks
+        _validate_attention_sink_page_size(
+            self.has_attention_sinks, model_runner.page_size
+        )
         if self.has_attention_sinks and get_parallel().attn_dcp_size > 1:
             raise ValueError(
                 "FlashInfer attention sinks are not supported with decode "
