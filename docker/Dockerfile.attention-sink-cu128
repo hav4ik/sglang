@@ -64,7 +64,7 @@ RUN uv pip install --python /usr/bin/python --no-cache \
         setuptools-rust setuptools-scm wheel
 
 # SGLang does not publish a cu128 wheel for kernel 0.4.4. This official cu129
-# wheel contains native sm90/sm120a cubins, no PTX, and links CUDA 12.x SONAMEs.
+# wheel contains native sm90/sm100/sm120a cubins, no PTX, and links CUDA 12.x SONAMEs.
 # Install it without dependencies so the image keeps the cu128 runtime stack.
 ARG SGL_KERNEL_WHEEL_SHA256=4ea2f7176965c3d1a5697254befe45c2ac995793577108129710d0f66ca85b33
 RUN curl -fL --retry 3 \

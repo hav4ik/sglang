@@ -94,6 +94,12 @@ def main():
                 )
         elif newer_tag:
             errors.append(f"newer CUDA package tag is forbidden: {name}=={version}")
+        elif re.fullmatch(r"nvidia-.*-cu12", name):
+            parsed = version_from_text(version)
+            if parsed and parsed > MAX_CUDA:
+                errors.append(
+                    f"newer CUDA component wheel is forbidden: {name}=={version}"
+                )
         if name in api_binding_packages | operational_cuda_packages:
             package_report[name] = version
         if name in operational_cuda_packages:
@@ -148,7 +154,7 @@ def main():
         for error in errors:
             print(f"- {error}", file=sys.stderr)
         return 1
-    print("CUDA 12.8 GATE PASSED")
+    print("CUDA 12.8 GATE PASSED", file=sys.stderr)
     return 0
 
 

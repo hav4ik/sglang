@@ -102,13 +102,14 @@ not advance and paused replicas remain paused.
 ```bash
 python -m pytest -q \
   test/registered/unit/model_loader/test_flash_rl_attention_sinks.py \
+  test/registered/unit/model_loader/test_attention_sink_checkpoint_tools.py \
   test/registered/unit/layers/test_flashinfer_attention_sinks.py \
   test/registered/attention/test_flashinfer_attention_sink.py
 ```
 
 These cover target 40:8 GQA, head dimension 128, prefill, cached extend, decode,
 full attention, short-window SWA, BF16 KV, FP8 KV on supported GPUs, and direct
-FlashInfer CUDA graph replay after sink mutation.
+FlashInfer CUDA graph replay after sink mutation at batch sizes 1, 2, and 8.
 
 ## H100/B200 Qualification
 
@@ -119,6 +120,7 @@ dependencies. On a fresh node, pull the image and activate this branch:
 docker pull chankhavu/proofpilot-sglang-sink:flashinfer-sink-cu128
 docker run --rm -it --gpus all --ipc=host \
   -v "$PWD/cache:/cache" -v "$PWD/workspace:/workspace" \
+  -v /shared/models:/models \
   chankhavu/proofpilot-sglang-sink:flashinfer-sink-cu128
 sglang-sink-bootstrap
 sglang-sink-check-cuda
@@ -133,7 +135,7 @@ Debian packages, or filesystem toolkits newer than CUDA 12.8. It reports but
 allows `cuda-python`/`cuda-bindings` 12.9.4 because they are Python API wrappers
 required by Torch's cu128 wheel, not toolkit/runtime libraries. It also permits
 only the checksum-pinned `sglang-kernel==0.4.4+cu129` native-wheel exception.
-That wheel contains sm90/sm120a cubins without PTX and resolves against the
+That wheel contains sm90/sm100/sm120a cubins without PTX and resolves against the
 image's CUDA 12.8 runtime libraries. The driver version shown by `nvidia-smi` is
 informational because it describes host compatibility rather than the container
 toolkit.
@@ -142,16 +144,16 @@ Use a fresh environment containing this exact checkout and its pinned FlashInfer
 
 ```bash
 # Kernel, SWA-boundary, FP8-KV, and 128K decode/extend tests.
-PROFILE=kernel PYTHON=/venv/bin/python \
+PROFILE=kernel PYTHON=python \
   scripts/attention_sink/run_hardware_validation.sh
 
 # Actual checkpoint under Triton and FlashInfer.
 PROFILE=server MODEL=/models/yccchen-olmo3-deploy TP=1 \
-  PYTHON=/venv/bin/python scripts/attention_sink/run_hardware_validation.sh
+  PYTHON=python scripts/attention_sink/run_hardware_validation.sh
 
 # A -> B -> A FlashRL cycle.
 PROFILE=rl MODEL=/checkpoints/a RELOAD_MODEL=/checkpoints/b TP=1 \
-  PYTHON=/venv/bin/python scripts/attention_sink/run_hardware_validation.sh
+  PYTHON=python scripts/attention_sink/run_hardware_validation.sh
 ```
 
 Set `TP` to 2, 4, or 8 for shard qualification. The result directory contains
@@ -161,6 +163,91 @@ Triton-versus-FlashInfer comparisons for BF16 and FP8 E4M3 KV caches. Set
 `KV_CACHE_DTYPES=auto` only for a faster diagnostic run; release qualification
 must run both defaults.
 
+The release checkpoint is `chankhavu/yccchen-olmo3-deploy` at revision
+`39beac79e6857df6d8a0dc27210f5affa4031c92`. It is a 32.5B BF16 model, so use
+TP=2 on 80 GB H100 and qualify both TP=1 and TP=2 on B200. Download it once to
+shared storage and create a copy-on-write sink variant:
+
+```bash
+hf download chankhavu/yccchen-olmo3-deploy \
+  --revision 39beac79e6857df6d8a0dc27210f5affa4031c92 \
+  --local-dir /models/yccchen-a
+python scripts/attention_sink/make_sink_variant.py \
+  /models/yccchen-a /models/yccchen-sink8 --value 8
+```
+
+The variant command requires reflink support and fails instead of making an
+unplanned 65 GB copy. Its default ramp pattern makes every layer and query head
+distinct, which is more sensitive to dropped, repeated, or incorrectly sharded
+sink weights than a constant value. For release E2E, run A -> sink8 -> A under
+both backends, weight quantizations, and KV-cache dtypes:
+
+Place both paths on the same reflink-capable XFS or Btrfs volume. Many NFS and
+ext4 model volumes do not support reflinks; on those filesystems, provision room
+for a second 65 GB checkpoint rather than weakening the command to a silent
+full copy.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 PROFILE=rl TP=2 SKIP_KERNEL_TESTS=1 \
+  MODEL=/models/yccchen-a RELOAD_MODEL=/models/yccchen-sink8 \
+  QUANTIZATIONS="none fp8" KV_CACHE_DTYPES="auto fp8_e4m3" \
+  PROBE_LENGTHS=128,4095,4096,4097,16384,131072 \
+  CONTEXT_LEN=131328 MEMFRAC=0.70 \
+  RESULTS=/workspace/results/h100-e2e \
+  scripts/attention_sink/run_hardware_validation.sh
+```
+
+On B200, run the same matrix first with `CUDA_VISIBLE_DEVICES=0 TP=1`, then with
+`CUDA_VISIBLE_DEVICES=0,1 TP=2`; use separate result directories. TP=1 verifies
+the unsharded sink path, while TP=2 verifies rank-distinct sink sharding.
+
+Separately validate the live tensor-transfer path for each backend. This sends
+global sentinel values through OLMo's TP loader, checks every local sink shard,
+proves behavior changes, restores the full checkpoint through FlashRL, and
+proves A parity:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python \
+  scripts/attention_sink/validate_live_sink_update.py \
+  --model /models/yccchen-a --tp 2 --attention-backend flashinfer \
+  --quantization fp8 --kv-cache-dtype fp8_e4m3 \
+  --lengths 128,4097,16384 \
+  --output /workspace/results/h100-live-flashinfer.json
+```
+
+The sink-only mutation sends a global 40-head tensor through OLMo's normal model
+loader, which slices a distinct range on every TP rank. It does not use FlashRL,
+because the transactional FlashRL loader requires a complete 771-weight
+checkpoint. The FP8 A -> B -> A cycle above is the full-checkpoint FlashRL test.
+
+Run the generic tensor-transport integration once at TP=2 before the 32B model:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m pytest -q -s \
+  test/registered/rl/test_update_weights_from_tensor.py::TestUpdateWeightsFromTensor::test_update_weights_from_tensor
+```
+
+Equivalently, set `RUN_DISTRIBUTED_TRANSPORT_TESTS=1` when running the kernel
+profile on a process with both GPUs visible; its output is then captured in the
+same result directory.
+
+Recommended hardware allocation:
+
+| Qualification | H100 | B200 |
+|---|---:|---:|
+| Targeted unit/kernel suite | 1 GPU | 1 GPU |
+| Real 32B server and A -> B -> A | 2 GPUs, TP=2 | 1 GPU TP=1, then 2 GPUs TP=2 |
+| Generic distributed tensor transport | 2 GPUs | 2 GPUs |
+| Synthetic sender-to-TP2 full BF16 update | Not recommended at 80 GB | 3 GPUs minimum |
+
+The last row needs one sender/staging GPU plus two rollout GPUs concurrently.
+The current full-weight receiver materializes the incoming 65 GB BF16 tensor set
+before commit, so two 80 GB H100s cannot honestly qualify that production shape.
+The disk-reload and sink-only tensor tests do not substitute for this final OPD
+integration test. A real trainer may need substantially more than one sender GPU
+for parameters, gradients, and optimizer state; three B200s is only the minimum
+synthetic transfer topology, not a full training allocation.
+
 Acceptance criteria:
 
 - No FP8 test skips on H100 (`sm90`) or B200 (`sm100`).
@@ -169,15 +256,19 @@ Acceptance criteria:
 - Triton and FlashInfer produce identical greedy server tokens.
 - Output-token logprobs differ by at most `0.05`.
 - A -> B -> A reproduces A's output IDs and logprobs.
+- Every TP rank reports 64 sink checksums, updated shards are rank-distinct, and
+  restore reproduces the original per-engine sink checksum exactly.
 - Cold head-dimension-128 FlashInfer JIT succeeds in an offline B200 container.
 
 ## Remaining Gaps
 
-- Real `FlashInferAttnBackend` metadata, RadixAttention, and graph batch-size
-  integration need full-server coverage; direct wrapper tests do not prove them.
+- Real `FlashInferAttnBackend` metadata and RadixAttention need full-server
+  coverage; direct wrapper graph tests do not prove them.
 - Full-server FP8 KV must pass separately on H100 and B200. FlashInfer 0.6.14 has
   no upstream sink+FP8 qualification.
-- TP 2/4/8 needs per-rank sink checksum and fresh-start-versus-reload parity.
+- TP 4/8 and the production DP/PP topology still need the per-rank sink checksum
+  test; the provided H100/B200 matrix covers TP 1/2.
+- Non-unit FP8 K/V scales are not covered by the direct kernel fixture.
 - Injected mid-commit GPU failure and single-TP-rank failure need fail-stop tests.
 - Concurrent generation must be aborted/retried during reload without admitting a
   mixed-version trajectory.

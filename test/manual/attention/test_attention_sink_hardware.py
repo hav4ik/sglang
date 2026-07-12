@@ -1,5 +1,6 @@
 """Long-context hardware qualification for OLMo3 attention sinks."""
 
+import math
 import os
 
 import pytest
@@ -52,6 +53,14 @@ def _assert_close(name, actual, expected, *, atol=3e-2, rtol=3e-2):
     torch.testing.assert_close(actual.float(), expected.float(), atol=atol, rtol=rtol)
 
 
+def _assert_sink_effect(name, sink_output, no_sink_output, min_relative=5e-2):
+    difference = (sink_output.float() - no_sink_output.float()).norm()
+    baseline = no_sink_output.float().norm().clamp_min(1e-12)
+    relative = (difference / baseline).item()
+    print(f"{name}: relative_sink_effect={relative:.6g}")
+    assert relative >= min_relative, (name, relative, min_relative)
+
+
 @pytest.mark.parametrize("seq_len", [4095, 4096, 4097, 32768, MAX_CONTEXT])
 @pytest.mark.parametrize("window_left", [-1, SWA_WINDOW_LEFT])
 def test_long_decode_matches_eager(seq_len, window_left):
@@ -99,11 +108,40 @@ def test_sink_extremes_control_denominator(window_left):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
     reason="E4M3 KV kernels require sm89 or newer",
 )
+@pytest.mark.parametrize("seq_len", [4097, MAX_CONTEXT])
 @pytest.mark.parametrize("window_left", [-1, SWA_WINDOW_LEFT])
-def test_fp8_kv_sink_attention(window_left):
-    q, k, v, sinks = _inputs(4097, 1, torch.float8_e4m3fn)
+def test_fp8_kv_sink_decode(seq_len, window_left):
+    q, k, v, sinks = _inputs(seq_len, 1, torch.float8_e4m3fn)
+    sinks = sinks + math.log(seq_len)
     expected = _eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
     flashinfer_out = _flashinfer_attention(q, k, v, sinks, window_left)
     triton_out = _triton_decode_attention(q, k, v, sinks, window_left)
+    no_sinks = torch.full_like(sinks, -80.0)
+    flashinfer_no_sink = _flashinfer_attention(q, k, v, no_sinks, window_left)
+    triton_no_sink = _triton_decode_attention(q, k, v, no_sinks, window_left)
+    _assert_sink_effect("flashinfer fp8 decode", flashinfer_out, flashinfer_no_sink)
+    _assert_sink_effect("triton fp8 decode", triton_out, triton_no_sink)
     _assert_close("flashinfer/eager fp8-kv", flashinfer_out, expected, atol=8e-2)
     _assert_close("triton/eager fp8-kv", triton_out, expected, atol=8e-2)
+    _assert_close("flashinfer/triton fp8-kv", flashinfer_out, triton_out, atol=8e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="E4M3 KV kernels require sm89 or newer",
+)
+@pytest.mark.parametrize("window_left", [-1, SWA_WINDOW_LEFT])
+def test_fp8_kv_sink_long_cached_extend(window_left):
+    q, k, v, sinks = _inputs(MAX_CONTEXT, 4, torch.float8_e4m3fn)
+    sinks = sinks + math.log(MAX_CONTEXT)
+    expected = _eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
+    flashinfer_out = _flashinfer_attention(q, k, v, sinks, window_left)
+    triton_out = _triton_extend_attention(q, k, v, sinks, window_left)
+    no_sinks = torch.full_like(sinks, -80.0)
+    flashinfer_no_sink = _flashinfer_attention(q, k, v, no_sinks, window_left)
+    triton_no_sink = _triton_extend_attention(q, k, v, no_sinks, window_left)
+    _assert_sink_effect("flashinfer fp8 extend", flashinfer_out, flashinfer_no_sink)
+    _assert_sink_effect("triton fp8 extend", triton_out, triton_no_sink)
+    _assert_close("flashinfer/eager fp8 extend", flashinfer_out, expected, atol=8e-2)
+    _assert_close("triton/eager fp8 extend", triton_out, expected, atol=8e-2)
+    _assert_close("flashinfer/triton fp8 extend", flashinfer_out, triton_out, atol=8e-2)

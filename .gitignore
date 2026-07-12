@@ -188,6 +188,7 @@ tl_out/
 *.pdf
 
 # personnal
+.git/
 work_dirs/
 *.csv
 

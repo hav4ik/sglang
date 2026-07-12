@@ -63,7 +63,7 @@ print("torch", torch.__version__, "CUDA", torch.version.cuda)
 print("flashinfer", md.version("flashinfer-python"))
 PY
 
-sglang-sink-check-cuda
+"$PYTHON" "$CHECKOUT/scripts/attention_sink/check_cuda_128.py"
 
 rm -rf "$CARGO_TARGET_DIR"
 trap - EXIT

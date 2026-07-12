@@ -615,6 +615,17 @@ class TestHandle(_WeightCheckerTestBase):
         self.assertIn("per_gpu_checksum", out)
         self.assertIn("parallelism_info", out)
 
+    def test_sink_checksum_action_filters_other_parameters(self):
+        with patch.object(
+            self.checker,
+            "_compute_checksum",
+            return_value={"checksums": {}},
+        ) as compute:
+            self.checker.handle("checksum_attention_sinks")
+        name_filter = compute.call_args.kwargs["name_filter"]
+        self.assertTrue(name_filter("model.layers.0.self_attn.sinks"))
+        self.assertFalse(name_filter("model.layers.0.self_attn.q_proj.weight"))
+
     def test_unknown_action_raises(self):
         with self.assertRaises(Exception) as ctx:
             self.checker.handle("nonsense_action")

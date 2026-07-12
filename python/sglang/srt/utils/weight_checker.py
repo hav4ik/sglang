@@ -80,6 +80,10 @@ class WeightChecker:
             return self._compare(allow_quant_error=allow_quant_error)
         elif action == "checksum":
             return self._compute_checksum()
+        elif action == "checksum_attention_sinks":
+            return self._compute_checksum(
+                name_filter=lambda name: name.endswith(".self_attn.sinks")
+            )
         else:
             raise Exception(f"Unsupported {action=}")
 
@@ -117,7 +121,7 @@ class WeightChecker:
             allow_quant_error=allow_quant_error,
         )
 
-    def _compute_checksum(self) -> Dict:
+    def _compute_checksum(self, name_filter=None) -> Dict:
         torch.cuda.synchronize()
         start = time.perf_counter()
 
@@ -134,7 +138,7 @@ class WeightChecker:
         for name, should_compare, comparable in _build_check_entries(
             dict(self._model_state()), skip_compare_names, quantized_set
         ):
-            if should_compare:
+            if should_compare and (name_filter is None or name_filter(name)):
                 checksums[name] = _hash_tensor(comparable.dequantize().data)
 
         h = hashlib.sha256()

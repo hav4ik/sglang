@@ -116,8 +116,8 @@ def _triton_extend_attention(q, k, v, sinks, window_left):
     extend_len = q.shape[1]
     prefix_len = seq_len - extend_len
     q_extend = q.flatten(0, 1).contiguous()
-    k_extend = k[:, prefix_len:].flatten(0, 1).contiguous()
-    v_extend = v[:, prefix_len:].flatten(0, 1).contiguous()
+    k_extend = k[:, prefix_len:].to(q.dtype).flatten(0, 1).contiguous()
+    v_extend = v[:, prefix_len:].to(q.dtype).flatten(0, 1).contiguous()
     k_buffer = k.flatten(0, 1).contiguous()
     v_buffer = v.flatten(0, 1).contiguous()
     o = torch.empty_like(q_extend)
@@ -266,29 +266,47 @@ def test_flashinfer_and_triton_attention_sinks_match_eager(
 
     flashinfer_out = _flashinfer_attention(q, k, v, sinks, window_left)
     expected = _eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
-    torch.testing.assert_close(flashinfer_out.float(), expected, rtol=3e-2, atol=3e-2)
+    tolerance = 8e-2 if kv_dtype == torch.float8_e4m3fn else 3e-2
+    torch.testing.assert_close(
+        flashinfer_out.float(), expected, rtol=tolerance, atol=tolerance
+    )
 
     if mode == "decode":
         triton_out = _triton_decode_attention(q, k, v, sinks, window_left)
     else:
         triton_out = _triton_extend_attention(q, k, v, sinks, window_left)
 
-    torch.testing.assert_close(triton_out.float(), expected, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(
-        flashinfer_out.float(), triton_out.float(), rtol=3e-2, atol=3e-2
+        triton_out.float(), expected, rtol=tolerance, atol=tolerance
+    )
+    torch.testing.assert_close(
+        flashinfer_out.float(),
+        triton_out.float(),
+        rtol=tolerance,
+        atol=tolerance,
     )
 
 
 @pytest.mark.parametrize("window_left", [-1, 4])
-def test_flashinfer_attention_sinks_cuda_graph_reads_reloaded_values(window_left):
+@pytest.mark.parametrize("batch_size", [1, 2, 8])
+@pytest.mark.parametrize(
+    "kv_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16-kv", "fp8-kv"]
+)
+def test_flashinfer_attention_sinks_cuda_graph_reads_reloaded_values(
+    window_left, batch_size, kv_dtype
+):
     torch.manual_seed(1)
     device, dtype = "cuda", torch.bfloat16
-    batch_size, seq_len, num_q_heads, num_kv_heads, head_dim = 2, 16, 40, 8, 128
+    if kv_dtype == torch.float8_e4m3fn and torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("E4M3 KV kernels require sm89 or newer")
+    seq_len, num_q_heads, num_kv_heads, head_dim = 16, 40, 8, 128
     q = torch.randn(batch_size, 1, num_q_heads, head_dim, device=device, dtype=dtype)
     k = torch.randn(
         batch_size, seq_len, num_kv_heads, head_dim, device=device, dtype=dtype
-    )
-    v = torch.randn_like(k)
+    ).to(kv_dtype)
+    v = torch.randn(
+        batch_size, seq_len, num_kv_heads, head_dim, device=device, dtype=dtype
+    ).to(kv_dtype)
     sinks = torch.zeros(num_q_heads, device=device, dtype=torch.float32)
     kv_cache, kv_indptr, kv_indices, last_page_len = _paged_kv(k, v)
     qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
@@ -303,7 +321,7 @@ def test_flashinfer_attention_sinks_cuda_graph_reads_reloaded_values(window_left
         paged_kv_last_page_len_buf=last_page_len,
         backend="fa2",
         q_data_type=dtype,
-        kv_data_type=dtype,
+        kv_data_type=kv_dtype,
         head_dim_qk=head_dim,
         head_dim_vo=head_dim,
         window_left=window_left,
@@ -321,7 +339,7 @@ def test_flashinfer_attention_sinks_cuda_graph_reads_reloaded_values(window_left
         causal=True,
         window_left=window_left,
         q_data_type=dtype,
-        kv_data_type=dtype,
+        kv_data_type=kv_dtype,
     )
 
     def run():
@@ -343,4 +361,5 @@ def test_flashinfer_attention_sinks_cuda_graph_reads_reloaded_values(window_left
     sinks.fill_(6.0)
     graph.replay()
     expected = _eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
-    torch.testing.assert_close(output.float(), expected, rtol=3e-2, atol=3e-2)
+    tolerance = 8e-2 if kv_dtype == torch.float8_e4m3fn else 3e-2
+    torch.testing.assert_close(output.float(), expected, rtol=tolerance, atol=tolerance)

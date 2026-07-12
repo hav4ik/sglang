@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -13,6 +14,24 @@ def post(url, endpoint, payload, timeout):
     response = requests.post(f"{url}{endpoint}", json=payload, timeout=timeout)
     response.raise_for_status()
     return response.json()
+
+
+def validate_generation_result(result, prompt_length):
+    output_ids = result.get("output_ids")
+    if not output_ids:
+        raise RuntimeError(f"probe at length {prompt_length} returned no output IDs")
+    logprobs = (result.get("meta_info") or {}).get("output_token_logprobs") or []
+    if not logprobs:
+        raise RuntimeError(f"probe at length {prompt_length} returned no logprobs")
+    if len(logprobs) != len(output_ids):
+        raise RuntimeError(
+            f"probe at length {prompt_length} returned {len(output_ids)} IDs but "
+            f"{len(logprobs)} logprobs"
+        )
+    if any(not token or not math.isfinite(float(token[0])) for token in logprobs):
+        raise RuntimeError(
+            f"probe at length {prompt_length} returned malformed or non-finite logprobs"
+        )
 
 
 def probe(url, model, lengths, output_tokens, timeout):
@@ -27,6 +46,7 @@ def probe(url, model, lengths, output_tokens, timeout):
         }
         started = time.time()
         result = post(url, "/generate", payload, timeout)
+        validate_generation_result(result, length)
         row = {
             "model": model,
             "prompt_length": length,
@@ -43,7 +63,7 @@ def probe(url, model, lengths, output_tokens, timeout):
     return results
 
 
-def reload(url, model_path, version, timeout):
+def reload(url, model_path, version, timeout, load_format):
     post(url, "/pause_generation", {"mode": "abort"}, timeout)
     result = post(
         url,
@@ -52,6 +72,7 @@ def reload(url, model_path, version, timeout):
             "model_path": model_path,
             "weight_version": str(version),
             "flush_cache": True,
+            "load_format": load_format,
         },
         timeout,
     )
@@ -74,18 +95,51 @@ def assert_probe_parity(expected, actual, logprob_atol):
         after_lp = (after["meta_info"] or {}).get("output_token_logprobs") or []
         if len(before_lp) != len(after_lp):
             raise AssertionError(f"reload changed logprob count at length {length}")
-        max_abs = max(
-            (
-                abs(float(left[0]) - float(right[0]))
-                for left, right in zip(before_lp, after_lp, strict=True)
-            ),
-            default=0.0,
-        )
+        deltas = []
+        for left, right in zip(before_lp, after_lp, strict=True):
+            left_value, right_value = float(left[0]), float(right[0])
+            if not math.isfinite(left_value) or not math.isfinite(right_value):
+                raise AssertionError(f"non-finite logprob at length {length}")
+            deltas.append(abs(left_value - right_value))
+        max_abs = max(deltas, default=0.0)
         if max_abs > logprob_atol:
             raise AssertionError(
                 f"reload logprob mismatch at length {length}: "
                 f"{max_abs} > {logprob_atol}"
             )
+
+
+def assert_probe_changed(before, after, min_logprob_delta):
+    if len(before) != len(after):
+        raise AssertionError("probe result lengths differ")
+    unchanged_lengths = []
+    for left, right in zip(before, after, strict=True):
+        if left["prompt_length"] != right["prompt_length"]:
+            raise AssertionError("probe prompt lengths differ")
+        if left["output_ids"] != right["output_ids"]:
+            continue
+        left_lp = (left["meta_info"] or {}).get("output_token_logprobs") or []
+        right_lp = (right["meta_info"] or {}).get("output_token_logprobs") or []
+        if len(left_lp) != len(right_lp):
+            raise AssertionError(
+                "reload changed logprob count without changing output IDs at "
+                f"length {left['prompt_length']}"
+            )
+        deltas = []
+        for a, b in zip(left_lp, right_lp, strict=True):
+            left_value, right_value = float(a[0]), float(b[0])
+            if not math.isfinite(left_value) or not math.isfinite(right_value):
+                raise AssertionError(
+                    f"non-finite logprob at length {left['prompt_length']}"
+                )
+            deltas.append(abs(left_value - right_value))
+        if max(deltas, default=0.0) < min_logprob_delta:
+            unchanged_lengths.append(left["prompt_length"])
+    if unchanged_lengths:
+        raise AssertionError(
+            "sink-mutated checkpoint did not materially change probes at lengths "
+            f"{unchanged_lengths}; required logprob delta >= {min_logprob_delta}"
+        )
 
 
 def main():
@@ -94,30 +148,67 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--lengths", default="128,4095,4096,4097,16384")
-    parser.add_argument("--output-tokens", type=int, default=1)
+    parser.add_argument("--output-tokens", type=int, default=4)
     parser.add_argument("--reload-model")
+    parser.add_argument("--reload-load-format", default="flash_rl")
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--logprob-atol", type=float, default=5e-2)
+    parser.add_argument("--require-reload-change", action="store_true")
+    parser.add_argument("--reload-change-min-logprob", type=float, default=1e-4)
     args = parser.parse_args()
 
     lengths = [int(value) for value in args.lengths.split(",") if value]
-    report = {
-        "initial": probe(
+    report = {}
+    try:
+        report["initial"] = probe(
             args.url, args.model, lengths, args.output_tokens, args.timeout
         )
-    }
-    if args.reload_model:
-        report["reload_to_b"] = reload(args.url, args.reload_model, 1, args.timeout)
-        report["after_b"] = probe(
-            args.url, args.reload_model, lengths, args.output_tokens, args.timeout
-        )
-        report["reload_to_a"] = reload(args.url, args.model, 2, args.timeout)
-        report["after_a"] = probe(
-            args.url, args.model, lengths, args.output_tokens, args.timeout
-        )
-        assert_probe_parity(report["initial"], report["after_a"], args.logprob_atol)
-
-    Path(args.output).write_text(json.dumps(report, indent=2, sort_keys=True))
+        if args.reload_model:
+            change_error = None
+            try:
+                report["reload_to_b"] = reload(
+                    args.url,
+                    args.reload_model,
+                    1,
+                    args.timeout,
+                    args.reload_load_format,
+                )
+                report["after_b"] = probe(
+                    args.url,
+                    args.reload_model,
+                    lengths,
+                    args.output_tokens,
+                    args.timeout,
+                )
+                if args.require_reload_change:
+                    assert_probe_changed(
+                        report["initial"],
+                        report["after_b"],
+                        args.reload_change_min_logprob,
+                    )
+            except Exception as exc:
+                change_error = exc
+            finally:
+                report["reload_to_a"] = reload(
+                    args.url,
+                    args.model,
+                    2,
+                    args.timeout,
+                    args.reload_load_format,
+                )
+            report["after_a"] = probe(
+                args.url, args.model, lengths, args.output_tokens, args.timeout
+            )
+            assert_probe_parity(report["initial"], report["after_a"], args.logprob_atol)
+            if change_error is not None:
+                raise change_error
+    except Exception as exc:
+        report["failure"] = {"type": type(exc).__name__, "message": str(exc)}
+        raise
+    finally:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

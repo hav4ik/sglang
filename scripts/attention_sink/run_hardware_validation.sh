@@ -8,12 +8,22 @@ PROFILE="${PROFILE:-kernel}"
 mkdir -p "$RESULTS"
 cd "$ROOT"
 
-if command -v sglang-sink-check-cuda >/dev/null 2>&1; then
-  sglang-sink-check-cuda | tee "$RESULTS/cuda-12.8-gate.json"
-else
-  "$PYTHON" scripts/attention_sink/check_cuda_128.py \
-    | tee "$RESULTS/cuda-12.8-gate.json"
-fi
+write_completion() {
+  "$PYTHON" - "$RESULTS/completion.json" "$PROFILE" <<'PY'
+import json, sys, time
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "status": "passed",
+    "profile": sys.argv[2],
+    "completed_unix_s": time.time(),
+}, indent=2, sort_keys=True) + "\n")
+PY
+}
+
+"$PYTHON" scripts/attention_sink/check_cuda_128.py \
+  2> >(tee "$RESULTS/cuda-12.8-gate.stderr" >&2) \
+  | tee "$RESULTS/cuda-12.8-gate.json"
 
 nvidia-smi -q >"$RESULTS/nvidia-smi.txt"
 git rev-parse HEAD >"$RESULTS/git-revision.txt"
@@ -36,18 +46,29 @@ print(json.dumps({
 }, indent=2))
 PY
 
-"$PYTHON" -m pytest -q \
-  test/registered/unit/model_loader/test_flash_rl_attention_sinks.py \
-  test/registered/unit/layers/test_flashinfer_attention_sinks.py \
-  test/registered/attention/test_flashinfer_attention_sink.py \
-  | tee "$RESULTS/registered-tests.txt"
+if [ "${SKIP_KERNEL_TESTS:-0}" != 1 ]; then
+  "$PYTHON" -m pytest -q \
+    test/registered/unit/model_loader/test_flash_rl_attention_sinks.py \
+    test/registered/unit/model_loader/test_attention_sink_checkpoint_tools.py \
+    test/registered/unit/layers/test_flashinfer_attention_sinks.py \
+    test/registered/unit/utils/test_weight_checker.py::TestHandle::test_sink_checksum_action_filters_other_parameters \
+    test/registered/attention/test_flashinfer_attention_sink.py \
+    | tee "$RESULTS/registered-tests.txt"
 
-SINK_LONG_MAX_CONTEXT="${SINK_LONG_MAX_CONTEXT:-131072}" \
-  "$PYTHON" -m pytest -q -s \
-  test/manual/attention/test_attention_sink_hardware.py \
-  | tee "$RESULTS/long-context-tests.txt"
+  SINK_LONG_MAX_CONTEXT="${SINK_LONG_MAX_CONTEXT:-131072}" \
+    "$PYTHON" -m pytest -q -s \
+    test/manual/attention/test_attention_sink_hardware.py \
+    | tee "$RESULTS/long-context-tests.txt"
+
+  if [ "${RUN_DISTRIBUTED_TRANSPORT_TESTS:-0}" = 1 ]; then
+    "$PYTHON" -m pytest -q -s \
+      test/registered/rl/test_update_weights_from_tensor.py::TestUpdateWeightsFromTensor::test_update_weights_from_tensor \
+      | tee "$RESULTS/distributed-tensor-transport.txt"
+  fi
+fi
 
 if [ "$PROFILE" = kernel ]; then
+  write_completion
   echo "kernel validation complete: $RESULTS"
   exit 0
 fi
@@ -57,6 +78,27 @@ TP="${TP:-1}"
 PORT="${PORT:-30000}"
 BACKENDS="${BACKENDS:-triton flashinfer}"
 KV_CACHE_DTYPES="${KV_CACHE_DTYPES:-auto fp8_e4m3}"
+QUANTIZATIONS="${QUANTIZATIONS:-fp8}"
+
+cleanup_server() {
+  kill "${monitor_pid:-}" "${rss_monitor_pid:-}" 2>/dev/null || true
+  if [ -n "${server_pid:-}" ]; then
+    kill -- -"$server_pid" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "$server_pid" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL -- -"$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  if [ -n "${monitor_pid:-}" ]; then
+    wait "$monitor_pid" 2>/dev/null || true
+  fi
+  if [ -n "${rss_monitor_pid:-}" ]; then
+    wait "$rss_monitor_pid" 2>/dev/null || true
+  fi
+}
+
 "$PYTHON" scripts/attention_sink/validate_checkpoint.py "$MODEL" \
   --output "$RESULTS/checkpoint-a.json"
 if [ "$PROFILE" = rl ]; then
@@ -65,24 +107,50 @@ if [ "$PROFILE" = rl ]; then
     --output "$RESULTS/checkpoint-b.json"
 fi
 
+for quantization in $QUANTIZATIONS; do
 for kv_cache_dtype in $KV_CACHE_DTYPES; do
 for backend in $BACKENDS; do
-  label="$backend-$kv_cache_dtype"
+  label="$backend-$kv_cache_dtype-$quantization"
   log="$RESULTS/server-$label.log"
+  quantization_args=()
+  load_format=auto
+  if [ "$quantization" != none ]; then
+    quantization_args=(--quantization "$quantization")
+    load_format=flash_rl
+  fi
+  if ! "$PYTHON" - "$PORT" <<'PY'
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    raise SystemExit(1)
+finally:
+    s.close()
+PY
+  then
+    echo "ERROR: port $PORT is already in use" >&2
+    exit 1
+  fi
   setsid "$PYTHON" -m sglang.launch_server \
     --model-path "$MODEL" \
     --tp-size "$TP" \
     --host 127.0.0.1 --port "$PORT" \
     --attention-backend "$backend" --page-size 1 \
-    --quantization fp8 --load-format flash_rl \
+    "${quantization_args[@]}" --load-format "$load_format" \
     --kv-cache-dtype "$kv_cache_dtype" \
-    --context-length "${CONTEXT_LEN:-131072}" \
+    --context-length "${CONTEXT_LEN:-131328}" \
     --chunked-prefill-size "${CHUNKED_PREFILL:-4096}" \
     --mem-fraction-static "${MEMFRAC:-0.80}" \
     --disable-radix-cache --skip-tokenizer-init \
     >"$log" 2>&1 &
   server_pid=$!
-  nvidia-smi \
+  gpu_query_args=()
+  if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    gpu_query_args=(-i "$CUDA_VISIBLE_DEVICES")
+  fi
+  nvidia-smi "${gpu_query_args[@]}" \
     --query-gpu=timestamp,index,memory.used,utilization.gpu \
     --format=csv -l 1 >"$RESULTS/gpu-$label.csv" &
   monitor_pid=$!
@@ -95,14 +163,14 @@ for backend in $BACKENDS; do
     done
   ) >"$RESULTS/process-memory-$label.txt" &
   rss_monitor_pid=$!
-  trap 'kill "$monitor_pid" "$rss_monitor_pid" 2>/dev/null || true; kill -- -"$server_pid" 2>/dev/null || true' EXIT
+  trap cleanup_server EXIT
   ready=0
   for _ in $(seq 1 360); do
-    if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null; then
-      ready=1; break
-    fi
     if ! kill -0 "$server_pid" 2>/dev/null; then
       tail -200 "$log"; exit 1
+    fi
+    if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null; then
+      ready=1; break
     fi
     sleep 5
   done
@@ -113,27 +181,44 @@ for backend in $BACKENDS; do
     --model "$MODEL"
     --output "$RESULTS/probe-$label.json"
     --lengths "${PROBE_LENGTHS:-128,4095,4096,4097,16384}"
+    --output-tokens "${PROBE_OUTPUT_TOKENS:-4}"
   )
   if [ "$PROFILE" = rl ]; then
-    probe_args+=(--reload-model "$RELOAD_MODEL")
+    probe_args+=(--reload-model "$RELOAD_MODEL" --reload-load-format "$load_format")
+    if [ "${REQUIRE_RELOAD_CHANGE:-1}" = 1 ]; then
+      probe_args+=(--require-reload-change)
+    fi
   fi
   "$PYTHON" scripts/attention_sink/probe_server.py "${probe_args[@]}"
-  kill "$monitor_pid" "$rss_monitor_pid" 2>/dev/null || true
-  wait "$monitor_pid" "$rss_monitor_pid" 2>/dev/null || true
-  kill -- -"$server_pid" 2>/dev/null || true
-  wait "$server_pid" || true
+  cleanup_server
   trap - EXIT
 done
-done
-
-for kv_cache_dtype in $KV_CACHE_DTYPES; do
-if [ -f "$RESULTS/probe-triton-$kv_cache_dtype.json" ] && \
-   [ -f "$RESULTS/probe-flashinfer-$kv_cache_dtype.json" ]; then
+if [ -f "$RESULTS/probe-triton-$kv_cache_dtype-$quantization.json" ] && \
+   [ -f "$RESULTS/probe-flashinfer-$kv_cache_dtype-$quantization.json" ]; then
   "$PYTHON" scripts/attention_sink/compare_probes.py \
-    "$RESULTS/probe-triton-$kv_cache_dtype.json" \
-    "$RESULTS/probe-flashinfer-$kv_cache_dtype.json" \
-    | tee "$RESULTS/backend-comparison-$kv_cache_dtype.json"
+    "$RESULTS/probe-triton-$kv_cache_dtype-$quantization.json" \
+    "$RESULTS/probe-flashinfer-$kv_cache_dtype-$quantization.json" \
+    | tee "$RESULTS/backend-comparison-$kv_cache_dtype-$quantization.json"
 fi
 done
+done
 
+if [ "$PROFILE" = rl ] && [ "${RUN_LIVE_SINK_UPDATE:-1}" = 1 ]; then
+  for quantization in ${LIVE_QUANTIZATIONS:-fp8}; do
+  for kv_cache_dtype in ${LIVE_KV_CACHE_DTYPES:-auto}; do
+  for backend in $BACKENDS; do
+    "$PYTHON" scripts/attention_sink/validate_live_sink_update.py \
+      --model "$MODEL" --tp "$TP" --attention-backend "$backend" \
+      --quantization "$quantization" --kv-cache-dtype "$kv_cache_dtype" \
+      --context-length "${CONTEXT_LEN:-131328}" \
+      --lengths "${LIVE_PROBE_LENGTHS:-128,4097,16384}" \
+      --output-tokens "${PROBE_OUTPUT_TOKENS:-4}" \
+      --mem-fraction-static "${MEMFRAC:-0.80}" \
+      --output "$RESULTS/live-$backend-$kv_cache_dtype-$quantization.json"
+  done
+  done
+  done
+fi
+
+write_completion
 echo "hardware validation complete: $RESULTS"
