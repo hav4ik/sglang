@@ -885,3 +885,37 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
 
 # Default command
 CMD ["/bin/bash"]
+
+########################################################
+########## Attention-Sink Validation Image ############
+########################################################
+# CUDA kernels remain architecture-specific JIT artifacts. This target contains
+# the full compiler toolchain plus the small Rust/protobuf toolchain required by
+# a runtime `pip install -e python --no-deps`.
+FROM runtime AS attention_sink_dev
+
+ENV PATH="/root/.cargo/bin:${PATH}" \
+    SGLANG_CHECKOUT=/workspace/sglang \
+    FLASHINFER_CACHE_DIR=/cache/flashinfer \
+    TRITON_CACHE_DIR=/cache/triton
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        protobuf-compiler libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf \
+        https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
+    && python3 -m pip install --no-cache-dir \
+        pytest pytest-asyncio setuptools-rust setuptools-scm wheel \
+    && rustc --version \
+    && cargo --version
+
+COPY --chmod=755 scripts/attention_sink/bootstrap_checkout.sh \
+    /usr/local/bin/sglang-sink-bootstrap
+COPY --chmod=755 scripts/attention_sink/run_all_tests.sh \
+    /usr/local/bin/sglang-sink-tests
+
+RUN mkdir -p /workspace /cache/flashinfer /cache/triton \
+    && chmod -R 777 /cache
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

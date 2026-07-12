@@ -167,6 +167,7 @@ class RadixAttention(nn.Module):
                     save_kv_cache,
                     self.layer_id,
                     idx_v=idx_v,
+                    sinks=kwargs.get("sinks"),
                 )
                 return idx_out, attn_out
             if self.qk_head_dim != self.v_head_dim:
@@ -298,6 +299,7 @@ def unified_sparse_attention_with_output(
     layer_id: int,
     *,
     idx_v: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> None:
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
@@ -327,6 +329,7 @@ def unified_sparse_attention_with_output(
         idx_q=idx_q,
         idx_k=idx_k,
         idx_v=idx_v,
+        sinks=sinks,
     )
     forward_batch.out_cache_loc = original_out_cache_loc
 

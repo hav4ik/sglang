@@ -44,6 +44,7 @@ Its core features include:
    advanced_features/object_storage.md
    advanced_features/hyperparameter_tuning.md
    advanced_features/attention_backend.md
+   advanced_features/attention_sinks.md
    advanced_features/speculative_decoding.ipynb
    advanced_features/adaptive_speculative_decoding.md
    advanced_features/structured_outputs.ipynb

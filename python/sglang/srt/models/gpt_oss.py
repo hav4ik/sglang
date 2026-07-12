@@ -385,10 +385,13 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
-        # others can use bfloat16
+        # FlashInfer's sink JIT and trtllm_mha both require float32 sink logits.
         attn_backend = get_server_args().attention_backend
-        sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
+        sinks_dtype = (
+            torch.float32
+            if attn_backend in ("flashinfer", "trtllm_mha")
+            else torch.bfloat16
+        )
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
         )

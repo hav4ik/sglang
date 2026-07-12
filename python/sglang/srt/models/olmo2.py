@@ -16,8 +16,9 @@
 
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/olmo2.py
-"""Inference-only OLMo2 model compatible with HuggingFace weights."""
+"""Inference-only OLMo2/OLMo3-sink models compatible with HuggingFace weights."""
 
+import logging
 from functools import partial
 from typing import Iterable, Optional, Tuple
 
@@ -49,6 +50,8 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
@@ -141,6 +144,29 @@ class Olmo2Attention(nn.Module):
             base=self.rope_theta,
             rope_scaling=self.rope_scaling,
         )
+        self.sinks = None
+        has_attention_sinks = (
+            getattr(config, "sink_init_value", None) is not None
+            or getattr(config, "model_type", None) == "olmo3_sink"
+            or "Olmo3SinkForCausalLM" in (getattr(config, "architectures", None) or [])
+        )
+        if has_attention_sinks:
+            # FlashInfer requires FP32 sinks. Triton accepts FP32 as well, and a
+            # backend-independent dtype also covers split prefill/decode backends.
+            sinks_dtype = torch.float32
+            self.sinks = nn.Parameter(
+                torch.full(
+                    (self.num_heads,),
+                    float(getattr(config, "sink_init_value", 0.0)),
+                    dtype=sinks_dtype,
+                ),
+                requires_grad=False,
+            )
+            if layer_id == 0:
+                logger.info(
+                    "OLMo3 attention sinks enabled "
+                    f"(num_heads={self.num_heads}, dtype={sinks_dtype})"
+                )
         self.scaling = self.head_dim**-0.5
         self.attn = RadixAttention(
             self.num_heads,
@@ -207,7 +233,13 @@ class Olmo2Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            **({"sinks": self.sinks} if self.sinks is not None else {}),
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -321,7 +353,6 @@ class Olmo2DecoderLayer(nn.Module):
 
 
 class Olmo2Model(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -450,8 +481,28 @@ class Olmo2ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_sink_names = set()
+        loaded_weight_names = set()
         for name, loaded_weight in weights:
+            loaded_weight_names.add(name)
             if "rotary_emb.inv_freq" in name:
+                continue
+            if "self_attn.sinks" in name:
+                if name not in params_dict:
+                    raise KeyError(f"Unexpected OLMo3 attention-sink weight: {name}")
+                param = params_dict[name]
+                parallel = get_parallel()
+                expected_numel = param.numel() * parallel.tp_size
+                if loaded_weight.ndim != 1 or loaded_weight.numel() != expected_numel:
+                    raise ValueError(
+                        f"Invalid OLMo3 attention-sink weight {name}: expected "
+                        f"[{expected_numel}], got {list(loaded_weight.shape)}"
+                    )
+                start = parallel.tp_rank * param.numel()
+                param.data.copy_(
+                    loaded_weight[start : start + param.numel()].to(param.dtype)
+                )
+                loaded_sink_names.add(name)
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
@@ -480,6 +531,76 @@ class Olmo2ForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+        self._last_loaded_attention_sink_names = loaded_sink_names
+        self._last_loaded_checkpoint_weight_names = loaded_weight_names
+        if loaded_sink_names:
+            logger.info(
+                "Loaded %d OLMo3 attention-sink tensors", len(loaded_sink_names)
+            )
+
+    def validate_loaded_attention_sinks(self) -> None:
+        expected = {
+            name
+            for name, _ in self.named_parameters()
+            if name.endswith(".self_attn.sinks")
+        }
+        if not expected:
+            return
+        loaded = getattr(self, "_last_loaded_attention_sink_names", set())
+        if loaded != expected:
+            missing = sorted(expected - loaded)
+            raise RuntimeError(
+                f"OLMo3 attention-sink tensors were not populated: missing={missing}"
+            )
+        expected_checkpoint = self.expected_checkpoint_weight_names()
+        loaded_checkpoint = getattr(self, "_last_loaded_checkpoint_weight_names", set())
+        missing_checkpoint = sorted(expected_checkpoint - loaded_checkpoint)
+        if missing_checkpoint:
+            raise RuntimeError(
+                "Incomplete OLMo3 checkpoint: "
+                f"missing={missing_checkpoint}"
+            )
+
+    def expected_checkpoint_weight_names(self) -> set[str]:
+        """Names required from a standard HF OLMo3 sink checkpoint."""
+        expected = {
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+        }
+        if not self.config.tie_word_embeddings:
+            expected.add("lm_head.weight")
+        for layer in range(self.config.num_hidden_layers):
+            prefix = f"model.layers.{layer}"
+            expected.update(
+                {
+                    f"{prefix}.self_attn.q_proj.weight",
+                    f"{prefix}.self_attn.k_proj.weight",
+                    f"{prefix}.self_attn.v_proj.weight",
+                    f"{prefix}.self_attn.o_proj.weight",
+                    f"{prefix}.self_attn.q_norm.weight",
+                    f"{prefix}.self_attn.k_norm.weight",
+                    f"{prefix}.self_attn.sinks",
+                    f"{prefix}.mlp.gate_proj.weight",
+                    f"{prefix}.mlp.up_proj.weight",
+                    f"{prefix}.mlp.down_proj.weight",
+                    f"{prefix}.post_attention_layernorm.weight",
+                    f"{prefix}.post_feedforward_layernorm.weight",
+                }
+            )
+            if self.config.attention_bias:
+                expected.update(
+                    {
+                        f"{prefix}.self_attn.q_proj.bias",
+                        f"{prefix}.self_attn.k_proj.bias",
+                        f"{prefix}.self_attn.v_proj.bias",
+                        f"{prefix}.self_attn.o_proj.bias",
+                    }
+                )
+        return expected
 
 
-EntryClass = Olmo2ForCausalLM
+class Olmo3SinkForCausalLM(Olmo2ForCausalLM):
+    """OLMo3 with one learned attention-sink logit per query head."""
+
+
+EntryClass = [Olmo2ForCausalLM, Olmo3SinkForCausalLM]

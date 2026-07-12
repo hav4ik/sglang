@@ -589,6 +589,8 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_xpu"
         elif is_hip():
             overrides["attention_backend"] = "aiter"
+        elif is_flashinfer_available():
+            overrides["attention_backend"] = "flashinfer"
         else:
             overrides["attention_backend"] = "triton"
     if is_xpu():

@@ -670,6 +670,14 @@ class ModelConfig:
         if "GptOssForCausalLM" in archs:
             return True
 
+        # OLMo3-sink checkpoints use the same per-query-head denominator sink.
+        if (
+            "Olmo3SinkForCausalLM" in archs
+            or getattr(self.hf_text_config, "model_type", None) == "olmo3_sink"
+            or getattr(self.hf_text_config, "sink_init_value", None) is not None
+        ):
+            return True
+
         # MiMoV2 creates sinks only when the config flags are set.
         if any(a in archs for a in (*MIMO_V2_MODEL_ARCHS, "MiMoV2MTP")):
             return getattr(

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import gc
 import inspect
 import logging
 import os
@@ -1830,12 +1829,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model = model_load_weights(self.model, iter)
             except Exception as e:
                 message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
+                    "Failed to update weights; keep generation paused because "
+                    f"the model state may be uncertain: {e}."
                 )
-                del iter
-                gc.collect()
-                iter = get_weight_iter(self.model_config)
-                self.model = model_load_weights(self.model, iter)
                 return False, message
 
         self.model = model

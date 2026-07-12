@@ -828,6 +828,12 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             model.load_weights(weights)
 
+        validate_loaded_sinks = getattr(
+            model, "validate_loaded_attention_sinks", None
+        )
+        if validate_loaded_sinks is not None:
+            validate_loaded_sinks()
+
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             memory_end = get_available_gpu_memory(
@@ -1010,6 +1016,12 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         """
         logger.info("[QuantizedRL] Initial load with FP8 quantization")
 
+        # update_weights_from_disk re-enters this method. Keep the one proxy
+        # installed during initial loading so reloads do not nest recursively.
+        if getattr(model, "flash_rl_initial_load_complete", False):
+            model.load_weights(weights)
+            return
+
         original_load_weights = model.load_weights
 
         def load_weights_proxy(weights):
@@ -1024,6 +1036,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         model.load_weights = load_weights_proxy
 
         model.load_weights(weights)
+        QuantizedRLModelLoader._validate_attention_sink_load(model)
         original_weights = dict(model.named_parameters())
 
         # Record pre-quantization state (shape/stride) for torch.as_strided reset
@@ -1095,6 +1108,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         return name, None, None
 
     @staticmethod
+    def _should_quantize_weight(weight: torch.Tensor) -> bool:
+        return weight.ndim >= 2 and weight.dtype in (
+            torch.bfloat16,
+            torch.float32,
+            torch.float16,
+        )
+
+    @staticmethod
     def _store_quantized_scale(
         scale_store: Dict[str, Union[torch.Tensor, Dict[Any, torch.Tensor]]],
         name: str,
@@ -1115,6 +1136,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         all_params: Dict[str, torch.nn.Parameter],
         param_name: str,
         scale_info: Union[torch.Tensor, Dict[Any, torch.Tensor], None],
+        *,
+        validate_only: bool = False,
     ) -> None:
         if scale_info is None:
             return
@@ -1140,21 +1163,18 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         scale_param = all_params.get(scale_param_name)
         if scale_param is None:
-            logger.warning(
-                "[QuantizedRL] Scale parameter not found: %s", scale_param_name
+            raise RuntimeError(
+                f"[QuantizedRL] Scale parameter not found: {scale_param_name}"
             )
-            return
         if isinstance(scale_info, torch.Tensor):
             new_scale = scale_info.t().contiguous()
-            if scale_param.data.shape == new_scale.shape:
-                scale_param.data.copy_(new_scale)
-            else:
-                logger.warning(
-                    "[QuantizedRL] Scale shape mismatch for %s: expected %s, got %s",
-                    scale_param_name,
-                    scale_param.data.shape,
-                    new_scale.shape,
+            if scale_param.data.shape != new_scale.shape:
+                raise RuntimeError(
+                    f"[QuantizedRL] Scale shape mismatch for {scale_param_name}: "
+                    f"expected {scale_param.data.shape}, got {new_scale.shape}"
                 )
+            if not validate_only:
+                scale_param.data.copy_(new_scale)
         else:
             stacked_key = next(
                 (
@@ -1174,8 +1194,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             )
             rows_per_shard = scale_param.data.shape[-1] // max(len(shard_names), 1)
             if rows_per_shard * len(shard_names) != scale_param.data.shape[-1]:
-                logger.warning(
-                    f"Scale param shape {scale_param.data.shape[-1]} not divisible by {len(shard_names)}"
+                raise RuntimeError(
+                    f"Scale param shape {scale_param.data.shape[-1]} not divisible "
+                    f"by {len(shard_names)}"
                 )
             offset = 0
             for idx, shard in enumerate(shard_names):
@@ -1185,15 +1206,27 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     else idx
                 )
                 shard_scale = scale_info.get(shard_id)
-                shard_scale = _get_tp_sharded_scale(shard_scale)
                 if shard_scale is None:
-                    offset += rows_per_shard
-                    continue
+                    raise RuntimeError(
+                        f"Missing quantized scale shard {shard_id!r} for {param_name}"
+                    )
+                shard_scale = _get_tp_sharded_scale(shard_scale)
                 shard_rows = shard_scale.shape[0]
                 start = offset
                 end = start + shard_rows
-                scale_param.data[..., start:end] = shard_scale.t().contiguous()
+                if end > scale_param.data.shape[-1]:
+                    raise RuntimeError(
+                        f"Scale shard {shard_id!r} for {param_name} exceeds "
+                        f"destination shape {scale_param.data.shape}"
+                    )
+                if not validate_only:
+                    scale_param.data[..., start:end] = shard_scale.t().contiguous()
                 offset = end
+            if offset != scale_param.data.shape[-1]:
+                raise RuntimeError(
+                    f"Scale shards for {param_name} cover {offset} rows, expected "
+                    f"{scale_param.data.shape[-1]}"
+                )
 
     @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
@@ -1205,9 +1238,11 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         logger.info("[QuantizedRL] Reload: Updating weights with FP8 quantization")
 
         weights_list = list(weights)
+        QuantizedRLModelLoader._validate_attention_sink_checkpoint(model, weights_list)
         updated_param_names, is_last_update = (
             QuantizedRLModelLoader._get_updated_params(weights_list, model)
         )
+        quantization_device = next(model.parameters()).device
 
         # Save current FP8 parameter data pointers
         existing_params = dict(model.named_parameters())
@@ -1216,15 +1251,22 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if name in existing_params:
                 current_param_data[name] = existing_params[name].data
 
-        # Reset to pre-quantization shape using torch.as_strided
-        # Keeps same storage, just changes view - critical for memory preservation
+        # Rebind parameters to scratch storage. Quantized matrices need CUDA
+        # scratch for the fused loader, while unquantized embeddings, norms, and
+        # sinks can stage on CPU without consuming long-context GPU headroom.
         for name, rebuild_info in model.original_weights_rebuild_keys.items():
             if name in updated_param_names and name in existing_params:
-                existing_params[name].data = torch.as_strided(
-                    # Note: avoid clone here
-                    existing_params[name].data.clone(),
+                old_data = current_param_data[name]
+                scratch_device = (
+                    old_data.device
+                    if old_data.dtype == torch.float8_e4m3fn
+                    else torch.device("cpu")
+                )
+                existing_params[name].data = torch.empty_strided(
                     rebuild_info["shape"],
                     rebuild_info["stride"],
+                    dtype=old_data.dtype,
+                    device=scratch_device,
                 )
 
         # Restore weight loader attributes (only if missing)
@@ -1266,7 +1308,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 ):
                     logger.info(f"[QuantizedRL] Skip: {name} ({weight.dtype})")
                     yield (name, weight)
-                elif weight.dtype in [torch.bfloat16, torch.float32, torch.float16]:
+                elif QuantizedRLModelLoader._should_quantize_weight(weight):
+                    if weight.device.type == "cpu":
+                        weight = weight.to(quantization_device)
                     qweight, scale = per_token_group_quant_fp8(weight, weight.shape[-1])
                     logger.info(f"[QuantizedRL] Quantize: {name} {weight.dtype}→FP8")
                     QuantizedRLModelLoader._store_quantized_scale(
@@ -1277,18 +1321,58 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     logger.info(f"[QuantizedRL] Keep: {name} ({weight.dtype})")
                     yield (name, weight)
 
-        # Load quantized weights (weight_loader stacks FP8 shards)
-        first_time_load_weights(quantize_weights_iterator(iter(weights_list)))
+        # Load into temporary parameter storage. Keep every original data pointer
+        # and value untouched until the complete checkpoint has loaded and passed
+        # validation.
+        try:
+            first_time_load_weights(quantize_weights_iterator(iter(weights_list)))
+            QuantizedRLModelLoader._validate_attention_sink_load(model)
+        except Exception:
+            failed_params = dict(model.named_parameters())
+            for name, old_data in current_param_data.items():
+                if name in failed_params:
+                    failed_params[name].data = old_data
+            raise
 
         # Copy back to original FP8 memory locations and update scales
         all_params = dict(model.named_parameters())
+        fp8_commit_views = {}
+
+        # Validate every destination before mutating any live storage.
+        try:
+            if quantization_device.type == "cuda":
+                torch.cuda.synchronize(quantization_device)
+            for name in updated_param_names:
+                if name not in all_params or name not in current_param_data:
+                    continue
+                new_param = all_params[name]
+                old_data = current_param_data[name]
+                if new_param.dtype != old_data.dtype:
+                    raise RuntimeError(
+                        f"Unexpected dtype mismatch for {name}: "
+                        f"new={new_param.dtype}, old={old_data.dtype}"
+                    )
+                if old_data.dtype == torch.float8_e4m3fn:
+                    fp8_commit_views[name] = torch.as_strided(
+                        new_param.data, old_data.shape, old_data.stride()
+                    )
+                elif new_param.shape != old_data.shape:
+                    raise RuntimeError(
+                        f"Unexpected shape mismatch for {name}: "
+                        f"new={tuple(new_param.shape)}, old={tuple(old_data.shape)}"
+                    )
+            for name, scale_info in quantized_scales.items():
+                QuantizedRLModelLoader._apply_scale_update(
+                    all_params, name, scale_info, validate_only=True
+                )
+        except Exception:
+            for name, old_data in current_param_data.items():
+                if name in all_params:
+                    all_params[name].data = old_data
+            raise
 
         for name in updated_param_names:
             if name not in all_params or name not in current_param_data:
-                continue
-            if any(
-                skip in name for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
-            ):
                 continue
 
             new_param = all_params[name]
@@ -1303,9 +1387,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 and old_fp8_data.dtype == torch.float8_e4m3fn
             ):
                 # FP8: Use strided view for transposed storage
-                strided_data = torch.as_strided(
-                    new_param.data, old_fp8_data.shape, old_fp8_data.stride()
-                )
+                strided_data = fp8_commit_views[name]
                 old_fp8_data.copy_(strided_data)
                 new_param.data = old_fp8_data
                 QuantizedRLModelLoader._apply_scale_update(
@@ -1317,11 +1399,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 # Same dtype (LayerNorm, etc.): Direct copy
                 old_fp8_data.copy_(new_param.data)
                 new_param.data = old_fp8_data
-            else:
-                raise RuntimeError(
-                    f"Unexpected dtype mismatch for {name}: "
-                    f"new={new_param.dtype}, old={old_fp8_data.dtype}"
-                )
 
         # Cleanup
         del current_param_data
@@ -1331,6 +1408,67 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         logger.info("[QuantizedRL] Reload complete")
         return updated_param_names, is_last_update
+
+    @staticmethod
+    def _attention_sink_param_names(model) -> set[str]:
+        return {
+            name
+            for name, _ in model.named_parameters()
+            if name.endswith(".self_attn.sinks")
+        }
+
+    @staticmethod
+    def _validate_attention_sink_checkpoint(model, weights_list) -> None:
+        sink_names = QuantizedRLModelLoader._attention_sink_param_names(model)
+        if not sink_names:
+            return
+        required_suffixes = (
+            ".self_attn.sinks",
+            ".self_attn.q_norm.weight",
+            ".self_attn.k_norm.weight",
+            ".post_attention_layernorm.weight",
+            ".post_feedforward_layernorm.weight",
+            ".norm.weight",
+        )
+        expected = {
+            name
+            for name, _ in model.named_parameters()
+            if name.endswith(required_suffixes)
+        }
+        provided = {name for name, _ in weights_list if name in expected}
+        if provided != expected:
+            missing = sorted(expected - provided)
+            raise RuntimeError(
+                "Incomplete OLMo3 checkpoint for FlashRL reload; refusing a "
+                f"partial update of sink or normalization weights: missing={missing}"
+            )
+        expected_checkpoint_names = getattr(
+            model, "expected_checkpoint_weight_names", None
+        )
+        if expected_checkpoint_names is not None:
+            required = expected_checkpoint_names()
+            checkpoint_names = {name for name, _ in weights_list}
+            missing_checkpoint = sorted(required - checkpoint_names)
+            if missing_checkpoint:
+                raise RuntimeError(
+                    "Incomplete OLMo3 checkpoint for FlashRL reload: "
+                    f"missing={missing_checkpoint}"
+                )
+
+    @staticmethod
+    def _validate_attention_sink_load(model) -> None:
+        expected = QuantizedRLModelLoader._attention_sink_param_names(model)
+        if not expected:
+            return
+        loaded = getattr(model, "_last_loaded_attention_sink_names", set())
+        if loaded != expected:
+            missing = sorted(expected - loaded)
+            raise RuntimeError(
+                f"OLMo3 attention-sink tensors were not populated: missing={missing}"
+            )
+        logger.info(
+            "[QuantizedRL] Verified %d OLMo3 attention-sink tensors", len(loaded)
+        )
 
     @staticmethod
     def _get_updated_params(weights_list, model):
@@ -1350,11 +1488,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         for name, _ in weights_list:
             if name == "lm_head.weight":
                 is_last_update = True
-
-            if any(
-                skip in name for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
-            ):
-                continue
 
             from sglang.srt.layers.utils import get_layer_id
 

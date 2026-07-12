@@ -167,6 +167,11 @@ class TritonAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
+        if self.dcp_size > 1 and model_runner.model_config.has_attention_sinks:
+            raise ValueError(
+                "Triton attention sinks are not supported with decode context "
+                "parallelism; disable DCP for sink models"
+            )
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         ) * self.dcp_size

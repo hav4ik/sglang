@@ -60,6 +60,50 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _run_flashinfer_paged_with_sinks(
+    wrapper,
+    q: torch.Tensor,
+    paged_kv_cache,
+    *,
+    sinks: torch.Tensor,
+    causal: Optional[bool] = None,
+    sm_scale: Optional[float] = None,
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+):
+    """Run FlashInfer's dedicated paged attention-sink JIT wrapper."""
+    if sinks.dtype != torch.float32:
+        raise TypeError(
+            f"FlashInfer attention sinks must be float32, got {sinks.dtype}"
+        )
+    if logits_soft_cap not in (None, 0.0):
+        raise ValueError(
+            "FlashInfer's attention-sink JIT does not support soft capping"
+        )
+    if causal is not None:
+        wrapper._causal = causal
+    if window_left != wrapper._sglang_sink_window_left:
+        raise ValueError(
+            "Attention-sink window does not match the compiled FlashInfer wrapper: "
+            f"requested={window_left}, compiled={wrapper._sglang_sink_window_left}"
+        )
+    effective_sm_scale = sm_scale
+    if effective_sm_scale is None:
+        effective_sm_scale = q.shape[-1] ** -0.5
+    if k_scale is not None:
+        effective_sm_scale *= k_scale
+    return wrapper.run(
+        q,
+        paged_kv_cache,
+        sinks,
+        effective_sm_scale,
+        v_scale=v_scale,
+        window_left=window_left,
+    )
+
+
 def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
     """Pad max_bs to the alignment cuda-graph capture uses (see get_batch_sizes_to_capture)."""
     mul_base = 1
@@ -79,6 +123,7 @@ if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
 
 if is_flashinfer_available():
     from flashinfer import (
+        BatchAttentionWithAttentionSinkWrapper,
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
@@ -225,12 +270,12 @@ def fast_prefill_plan(
     is identical to plan()'s.
     """
     assert self.is_cuda_graph_enabled, "fast_prefill_plan is cuda-graph only"
-    assert (
-        getattr(self, "_backend", None) == "fa2"
-    ), "fast_prefill_plan supports the fa2 backend only"
-    assert (
-        getattr(self, "_cached_module", None) is not None
-    ), "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
+    assert getattr(self, "_backend", None) == "fa2", (
+        "fast_prefill_plan supports the fa2 backend only"
+    )
+    assert getattr(self, "_cached_module", None) is not None, (
+        "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
+    )
 
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
@@ -331,8 +376,33 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
         self.max_context_len = model_runner.model_config.context_len
+        self.sliding_window_size = model_runner.sliding_window_size
+        self.q_data_type = model_runner.dtype
+        self.kv_data_type = model_runner.kv_cache_dtype
+        self.head_dim = model_runner.model_config.head_dim
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.has_attention_sinks = model_runner.model_config.has_attention_sinks
+        if self.has_attention_sinks and get_parallel().attn_dcp_size > 1:
+            raise ValueError(
+                "FlashInfer attention sinks are not supported with decode "
+                "context parallelism; disable DCP for sink models"
+            )
+        if self.has_attention_sinks and self.enable_mis:
+            raise ValueError(
+                "FlashInfer attention-sink kernels do not support multi-item "
+                "scoring metadata; use --attention-backend triton"
+            )
+        if (
+            self.has_attention_sinks
+            and self.kv_data_type == torch.float8_e4m3fn
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability(model_runner.device) < (8, 9)
+        ):
+            raise ValueError(
+                "FlashInfer E4M3 KV attention sinks require sm89 or newer; "
+                "use BF16 KV cache on this GPU"
+            )
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -422,7 +492,7 @@ class FlashInferAttnBackend(AttentionBackend):
             assert self.num_wrappers == 1
             self.kv_last_page_len = kv_last_page_len_buf
 
-        if not self.skip_prefill:
+        if not self.skip_prefill or self.has_attention_sinks:
             self.qo_indptr = [
                 torch.zeros(
                     (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -445,30 +515,15 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
-        for _ in range(self.num_wrappers):
+        for wrapper_id in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
-                    )
+                    self._create_paged_prefill_wrapper(wrapper_id)
                 )
                 self.prefill_wrappers_verify.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
-                    )
+                    self._create_paged_prefill_wrapper(wrapper_id)
                 )
-            self.decode_wrappers.append(
-                BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    backend=self.decode_backend,
-                    use_tensor_cores=self.decode_use_tensor_cores,
-                )
-            )
+            self.decode_wrappers.append(self._create_decode_wrapper(wrapper_id))
 
         # Create indices updater
         if not skip_prefill:
@@ -510,6 +565,48 @@ class FlashInferAttnBackend(AttentionBackend):
 
         kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
         return kvcache if isinstance(kvcache, BaseSWAKVPool) else None
+
+    def _sink_window_left(self, wrapper_id: int) -> int:
+        if self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW and wrapper_id == 0:
+            assert self.sliding_window_size is not None
+            return self.sliding_window_size
+        return -1
+
+    def _create_paged_prefill_wrapper(self, wrapper_id: int, workspace=None, **kwargs):
+        workspace = self.workspace_buffer if workspace is None else workspace
+        if not self.has_attention_sinks:
+            return BatchPrefillWithPagedKVCacheWrapper(
+                workspace, "NHD", backend=self.prefill_backend, **kwargs
+            )
+
+        window_left = self._sink_window_left(wrapper_id)
+        wrapper = BatchAttentionWithAttentionSinkWrapper(
+            workspace,
+            "NHD",
+            backend=self.prefill_backend,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.kv_data_type,
+            head_dim_qk=self.head_dim,
+            head_dim_vo=self.head_dim,
+            window_left=window_left,
+            **kwargs,
+        )
+        wrapper._sglang_sink_window_left = window_left
+        return wrapper
+
+    def _create_decode_wrapper(self, wrapper_id: int, **kwargs):
+        if not self.has_attention_sinks:
+            return BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.decode_backend,
+                use_tensor_cores=self.decode_use_tensor_cores,
+                **kwargs,
+            )
+
+        wrapper = self._create_paged_prefill_wrapper(wrapper_id, **kwargs)
+        wrapper._sglang_decode_qo_indptr = self.qo_indptr[wrapper_id]
+        return wrapper
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -730,7 +827,11 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             raise ValueError("Invalid forward mode")
 
-        if in_capture and forward_mode.is_decode_or_idle():
+        if (
+            in_capture
+            and forward_mode.is_decode_or_idle()
+            and not self.has_attention_sinks
+        ):
             # fast_decode_plan needs _cached_module from the initial begin_forward
             # above, so install it only after that first plan has run.
             for w in self.decode_cuda_graph_metadata[bs]:
@@ -825,6 +926,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     not self.enable_deterministic
                     and not is_in_tc_piecewise_cuda_graph()
                     and not self.use_paged
+                    and not self.has_attention_sinks
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
@@ -900,19 +1002,25 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
-        return [
-            BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace_buffer,
-                "NHD",
-                backend=self.decode_backend,
-                use_cuda_graph=True,
-                use_tensor_cores=self.decode_use_tensor_cores,
-                paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
-                paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
-            )
-            for i in range(self.num_wrappers)
-        ]
+        wrappers = []
+        for i in range(self.num_wrappers):
+            if self.has_attention_sinks:
+                kwargs = {
+                    "use_cuda_graph": True,
+                    "qo_indptr_buf": self.qo_indptr[i][: num_tokens + 1],
+                    "paged_kv_indptr_buf": self.kv_indptr[i][: num_tokens + 1],
+                    "paged_kv_indices_buf": self.cuda_graph_kv_indices[i],
+                    "paged_kv_last_page_len_buf": self.kv_last_page_len[:num_tokens],
+                }
+            else:
+                kwargs = {
+                    "use_cuda_graph": True,
+                    "paged_kv_indptr_buffer": self.kv_indptr[i][: num_tokens + 1],
+                    "paged_kv_indices_buffer": self.cuda_graph_kv_indices[i],
+                    "paged_kv_last_page_len_buffer": self.kv_last_page_len[:num_tokens],
+                }
+            wrappers.append(self._create_decode_wrapper(i, **kwargs))
+        return wrappers
 
     def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether
@@ -931,11 +1039,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 else {}
             )
             wrappers.append(
-                BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
+                self._create_paged_prefill_wrapper(
+                    i,
                     use_cuda_graph=True,
-                    backend=self.prefill_backend,
                     qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
                     paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                     paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
@@ -1042,11 +1148,10 @@ class FlashInferAttnBackend(AttentionBackend):
             for _ in range(self.num_wrappers)
         ]
         return [
-            BatchPrefillWithPagedKVCacheWrapper(
-                self.full_cg_prefill_workspace_buffer,
-                "NHD",
+            self._create_paged_prefill_wrapper(
+                i,
+                workspace=self.full_cg_prefill_workspace_buffer,
                 use_cuda_graph=True,
-                backend=self.prefill_backend,
                 qo_indptr_buf=self.full_cg_prefill_qo_indptr[i],
                 paged_kv_indptr_buf=self.full_cg_prefill_kv_indptr[i],
                 paged_kv_indices_buf=self.full_cg_prefill_kv_indices[i],
@@ -1072,6 +1177,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
             )
+            if self.has_attention_sinks and use_custom_mask:
+                raise ValueError(
+                    "FlashInfer attention-sink kernels do not support custom "
+                    "verification masks; use --attention-backend triton"
+                )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
@@ -1105,6 +1215,7 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks: Optional[torch.Tensor] = None,
     ):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
@@ -1135,31 +1246,49 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=causal,
-                sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+            # Disable sliding window attention for multi-item scoring: item-aware
+            # masking takes precedence over a simple window boundary.
+            window_left = (
+                layer.sliding_window_size
+                if not (
+                    self.forward_metadata.multi_item_params
+                    and self.forward_metadata.multi_item_params.is_enabled()
+                )
+                else -1
             )
+            q_view = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            if sinks is None:
+                o = prefill_wrapper_paged.forward(
+                    q_view,
+                    kv_cache,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+            else:
+                o = _run_flashinfer_paged_with_sinks(
+                    prefill_wrapper_paged,
+                    q_view,
+                    kv_cache,
+                    sinks=sinks,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
         else:
+            if sinks is not None:
+                raise RuntimeError(
+                    "FlashInfer attention sinks require paged prefill metadata; "
+                    "ragged prefill must be disabled for sink models"
+                )
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over
             # previously cached context without re-materializing KV tensors (e.g., the
@@ -1239,6 +1368,7 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks: Optional[torch.Tensor] = None,
     ):
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
@@ -1262,15 +1392,31 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         # Call the wrapped function
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if sinks is None:
+            o = decode_wrapper.forward(
+                q_view,
+                kv_cache,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+        else:
+            o = _run_flashinfer_paged_with_sinks(
+                decode_wrapper,
+                q_view,
+                kv_cache,
+                sinks=sinks,
+                causal=True,
+                sm_scale=layer.scaling,
+                window_left=layer.sliding_window_size,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -1507,12 +1653,37 @@ class FlashInferIndicesUpdaterDecode:
 
         # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
         # by checking if it's a partial function with fast_decode_plan as the func
+        wrapper_is_attention_sink = hasattr(wrapper, "_sglang_sink_window_left")
         wrapper_uses_fast_decode_plan = (
             hasattr(wrapper.begin_forward, "func")
             and wrapper.begin_forward.func == fast_decode_plan
         )
 
-        if wrapper_uses_fast_decode_plan:
+        if wrapper_is_attention_sink:
+            qo_indptr = wrapper._sglang_decode_qo_indptr[: bs + 1]
+            qo_indptr.copy_(
+                torch.arange(bs + 1, dtype=torch.int32, device=qo_indptr.device)
+            )
+            wrapper.begin_forward(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                causal=True,
+                window_left=wrapper._sglang_sink_window_left,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                non_blocking=True,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=(
+                    disable_split_kv if disable_split_kv is not None else False
+                ),
+            )
+        elif wrapper_uses_fast_decode_plan:
             # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
             wrapper.begin_forward(
                 kv_indptr,
@@ -1923,6 +2094,12 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
+        if self.has_attention_sinks and use_custom_mask is not None:
+            raise ValueError(
+                "FlashInfer attention-sink kernels do not support custom masks; "
+                "use --attention-backend triton"
+            )
+
         # fast_prefill_plan (installed at capture) is sync-free: it needs the
         # host-known qo/kv layout from the caller. Assert rather than silently
         # fall back to plan()'s blocking D2H on the replay hot-path.
@@ -1933,12 +2110,12 @@ class FlashInferIndicesUpdaterPrefill:
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
         if uses_fast_prefill:
-            assert (
-                seq_lens_cpu is not None
-            ), "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
-            assert (
-                num_tokens_per_req is not None and num_tokens_per_req > 0
-            ), f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
+            assert seq_lens_cpu is not None, (
+                "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
+            )
+            assert num_tokens_per_req is not None and num_tokens_per_req > 0, (
+                f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
+            )
             seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
             qo_indptr_host = torch.arange(
                 0,
@@ -1969,6 +2146,7 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
+            window_left=getattr(wrapper_paged, "_sglang_sink_window_left", -1),
             non_blocking=True,
             fixed_split_size=fixed_split_size,
             prefix_len_ptr=prefix_len_ptr,
