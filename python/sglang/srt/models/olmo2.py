@@ -184,6 +184,16 @@ class Olmo2Attention(nn.Module):
         self.sink_trace_tokens = int(
             os.getenv("SGLANG_ATTENTION_SINK_TRACE_TOKENS", "128")
         )
+        self.sink_trace_mode = os.getenv(
+            "SGLANG_ATTENTION_SINK_TRACE_MODE", "prefill"
+        )
+        self.sink_trace_positions = {
+            int(position)
+            for position in os.getenv(
+                "SGLANG_ATTENTION_SINK_TRACE_POSITIONS", "128,129,130"
+            ).split(",")
+            if position
+        }
         self.scaling = self.head_dim**-0.5
         self.attn = RadixAttention(
             self.num_heads,
@@ -270,17 +280,35 @@ class Olmo2Attention(nn.Module):
         attn_output: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        if (
-            not self.sink_trace_dir
-            or self.sinks is None
-            or get_is_capture_mode()
-            or not forward_batch.forward_mode.is_extend()
-            or q.shape[0] != self.sink_trace_tokens
-        ):
+        if not self.sink_trace_dir or self.sinks is None or get_is_capture_mode():
             return
 
         trace_dir = Path(self.sink_trace_dir) / f"tp{self.tp_rank}"
-        trace_path = trace_dir / f"layer-{self.layer_id:02d}.pt"
+        if (
+            self.sink_trace_mode in ("prefill", "all")
+            and forward_batch.forward_mode.is_extend()
+            and q.shape[0] == self.sink_trace_tokens
+        ):
+            trace_path = trace_dir / f"layer-{self.layer_id:02d}.pt"
+            trace_kind = "prefill"
+        elif (
+            self.sink_trace_mode in ("decode", "all")
+            and forward_batch.forward_mode.is_decode()
+            and q.shape[0] == 1
+        ):
+            position_values = positions.detach().cpu().flatten().tolist()
+            if len(position_values) != 1:
+                return
+            position = int(position_values[0])
+            if position not in self.sink_trace_positions:
+                return
+            trace_path = (
+                trace_dir / f"decode-pos-{position}-layer-{self.layer_id:02d}.pt"
+            )
+            trace_kind = "decode"
+        else:
+            return
+
         if trace_path.exists():
             return
 
@@ -288,6 +316,7 @@ class Olmo2Attention(nn.Module):
         payload = {
             "layer_id": self.layer_id,
             "tp_rank": self.tp_rank,
+            "trace_kind": trace_kind,
             "num_q_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
             "head_dim": self.head_dim,
