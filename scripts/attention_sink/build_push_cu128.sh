@@ -3,8 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE="${IMAGE:-chankhavu/proofpilot-sglang-sink:flashinfer-sink-cu128}"
-BUILDER="${BUILDER:-sglang-sink-cu128-$$}"
+BUILDER="${BUILDER:-sglang-sink-cu128-build}"
 MIN_FREE_GB="${MIN_FREE_GB:-70}"
+PRESERVE_BUILDER_ON_FAILURE="${PRESERVE_BUILDER_ON_FAILURE:-1}"
 REVISION="$(git -C "$ROOT" rev-parse HEAD)"
 REVISION_TAG="${IMAGE%:*}:cu128-${REVISION:0:12}"
 
@@ -19,11 +20,20 @@ if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
 fi
 
 cleanup() {
-  docker buildx rm -f "$BUILDER" >/dev/null 2>&1 || true
+  status=$?
+  if [ "$status" -eq 0 ] || [ "$PRESERVE_BUILDER_ON_FAILURE" != 1 ]; then
+    docker buildx rm -f "$BUILDER" >/dev/null 2>&1 || true
+  else
+    echo "build failed; preserving isolated builder cache: $BUILDER" >&2
+  fi
 }
 trap cleanup EXIT
 
-docker buildx create --name "$BUILDER" --driver docker-container --use >/dev/null
+if docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+  docker buildx use "$BUILDER"
+else
+  docker buildx create --name "$BUILDER" --driver docker-container --use >/dev/null
+fi
 docker buildx inspect --bootstrap >/dev/null
 docker buildx build "$ROOT" \
   --builder "$BUILDER" \
