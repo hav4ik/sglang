@@ -19,10 +19,13 @@ from scripts.attention_sink.kernel_test_utils import (  # noqa: E402
 )
 
 
-def tensor_delta(left: torch.Tensor, right: torch.Tensor) -> dict:
+def tensor_delta(
+    left: torch.Tensor, right: torch.Tensor, *, atol: float, rtol: float
+) -> dict:
     left = left.float()
     right = right.float()
     delta = left - right
+    close = torch.isclose(left, right, atol=atol, rtol=rtol)
     right_norm = torch.linalg.vector_norm(right)
     return {
         "max_abs": torch.max(torch.abs(delta)).item(),
@@ -30,6 +33,9 @@ def tensor_delta(left: torch.Tensor, right: torch.Tensor) -> dict:
         "relative_l2": (
             torch.linalg.vector_norm(delta) / right_norm.clamp_min(1e-30)
         ).item(),
+        "mismatched_elements": int(torch.count_nonzero(~close)),
+        "total_elements": left.numel(),
+        "within_tolerance": bool(torch.all(close)),
     }
 
 
@@ -64,7 +70,7 @@ def reshape_trace(trace: dict, device: torch.device) -> tuple:
     return q, k, v, sinks
 
 
-def replay(trace: dict, device: torch.device) -> dict:
+def replay(trace: dict, device: torch.device, *, atol: float, rtol: float) -> dict:
     q, k, v, sinks = reshape_trace(trace, device)
     window_left = trace["sliding_window_size"]
     expected = eager_reference(q, k, v, sinks, causal=True, window_left=window_left)
@@ -72,12 +78,14 @@ def replay(trace: dict, device: torch.device) -> dict:
     flashinfer = flashinfer_attention(q, k, v, sinks, window_left).float()
     production = trace["attention_output"].view_as(q).to(device).float()
     return {
-        "triton_vs_eager": tensor_delta(triton, expected),
-        "flashinfer_vs_eager": tensor_delta(flashinfer, expected),
-        "flashinfer_vs_triton": tensor_delta(flashinfer, triton),
-        "production_vs_eager": tensor_delta(production, expected),
-        "production_vs_triton": tensor_delta(production, triton),
-        "production_vs_flashinfer": tensor_delta(production, flashinfer),
+        "triton_vs_eager": tensor_delta(triton, expected, atol=atol, rtol=rtol),
+        "flashinfer_vs_eager": tensor_delta(flashinfer, expected, atol=atol, rtol=rtol),
+        "flashinfer_vs_triton": tensor_delta(flashinfer, triton, atol=atol, rtol=rtol),
+        "production_vs_eager": tensor_delta(production, expected, atol=atol, rtol=rtol),
+        "production_vs_triton": tensor_delta(production, triton, atol=atol, rtol=rtol),
+        "production_vs_flashinfer": tensor_delta(
+            production, flashinfer, atol=atol, rtol=rtol
+        ),
     }
 
 
@@ -87,6 +95,8 @@ def main() -> None:
     parser.add_argument("flashinfer_trace", type=Path)
     parser.add_argument("--tp-rank", type=int, default=0)
     parser.add_argument("--replay-layer", type=int, default=0)
+    parser.add_argument("--atol", type=float, default=3e-2)
+    parser.add_argument("--rtol", type=float, default=3e-2)
     args = parser.parse_args()
 
     triton_layers = available_layers(args.triton_trace, args.tp_rank)
@@ -106,12 +116,26 @@ def main() -> None:
         layer_deltas.append(
             {
                 "layer_id": layer_id,
-                "q": tensor_delta(flashinfer["q"], triton["q"]),
-                "k": tensor_delta(flashinfer["k"], triton["k"]),
-                "v": tensor_delta(flashinfer["v"], triton["v"]),
-                "sinks": tensor_delta(flashinfer["sinks"], triton["sinks"]),
+                "q": tensor_delta(
+                    flashinfer["q"], triton["q"], atol=args.atol, rtol=args.rtol
+                ),
+                "k": tensor_delta(
+                    flashinfer["k"], triton["k"], atol=args.atol, rtol=args.rtol
+                ),
+                "v": tensor_delta(
+                    flashinfer["v"], triton["v"], atol=args.atol, rtol=args.rtol
+                ),
+                "sinks": tensor_delta(
+                    flashinfer["sinks"],
+                    triton["sinks"],
+                    atol=args.atol,
+                    rtol=args.rtol,
+                ),
                 "attention_output": tensor_delta(
-                    flashinfer["attention_output"], triton["attention_output"]
+                    flashinfer["attention_output"],
+                    triton["attention_output"],
+                    atol=args.atol,
+                    rtol=args.rtol,
                 ),
             }
         )
@@ -121,26 +145,70 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for Triton and FlashInfer replay")
     device = torch.device("cuda")
-    triton_replay = replay(
-        load_trace(args.triton_trace, args.tp_rank, args.replay_layer), device
+    triton_trace = load_trace(args.triton_trace, args.tp_rank, args.replay_layer)
+    flashinfer_trace = load_trace(
+        args.flashinfer_trace, args.tp_rank, args.replay_layer
     )
-    flashinfer_replay = replay(
-        load_trace(args.flashinfer_trace, args.tp_rank, args.replay_layer), device
-    )
+    triton_replay = replay(triton_trace, device, atol=args.atol, rtol=args.rtol)
+    flashinfer_replay = replay(flashinfer_trace, device, atol=args.atol, rtol=args.rtol)
 
-    print(
-        json.dumps(
+    checks = {
+        "positions_identical": torch.equal(
+            triton_trace["positions"], flashinfer_trace["positions"]
+        ),
+        "sinks_identical": torch.equal(
+            triton_trace["sinks"], flashinfer_trace["sinks"]
+        ),
+        "triton_native_matches_replay": triton_replay["production_vs_triton"][
+            "within_tolerance"
+        ],
+        "flashinfer_native_matches_replay": flashinfer_replay[
+            "production_vs_flashinfer"
+        ]["within_tolerance"],
+        "triton_replay_matches_eager": triton_replay["triton_vs_eager"][
+            "within_tolerance"
+        ],
+        "flashinfer_replay_matches_eager": flashinfer_replay["flashinfer_vs_eager"][
+            "within_tolerance"
+        ],
+        "backend_replays_match": triton_replay["flashinfer_vs_triton"][
+            "within_tolerance"
+        ],
+    }
+    if args.replay_layer == 0:
+        checks.update(
             {
-                "tp_rank": args.tp_rank,
-                "captured_layers": sorted(triton_layers),
-                "cross_backend_layer_deltas": layer_deltas,
-                "replay_layer": args.replay_layer,
-                "triton_trace_replay": triton_replay,
-                "flashinfer_trace_replay": flashinfer_replay,
-            },
-            indent=2,
+                "layer0_q_identical": torch.equal(
+                    triton_trace["q"], flashinfer_trace["q"]
+                ),
+                "layer0_k_identical": torch.equal(
+                    triton_trace["k"], flashinfer_trace["k"]
+                ),
+                "layer0_v_identical": torch.equal(
+                    triton_trace["v"], flashinfer_trace["v"]
+                ),
+            }
         )
-    )
+
+    passed = all(checks.values())
+    report = {
+        "verdict": {
+            "passed": passed,
+            "atol": args.atol,
+            "rtol": args.rtol,
+            "checks": checks,
+        },
+        "tp_rank": args.tp_rank,
+        "captured_layers": sorted(triton_layers),
+        "replay_layer": args.replay_layer,
+        "triton_trace_replay": triton_replay,
+        "flashinfer_trace_replay": flashinfer_replay,
+        "cross_backend_layer_deltas": layer_deltas,
+    }
+    print(json.dumps(report, indent=2))
+    if not passed:
+        failed = [name for name, result in checks.items() if not result]
+        raise SystemExit(f"attention trace validation failed: {failed}")
 
 
 if __name__ == "__main__":
