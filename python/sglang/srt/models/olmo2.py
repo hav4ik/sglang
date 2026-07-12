@@ -62,6 +62,15 @@ def get_attention_sliding_window_size(config):
     return config.sliding_window - 1 if hasattr(config, "sliding_window") else None
 
 
+def get_olmo_rope_theta(config) -> float:
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+        return float(rope_parameters["rope_theta"])
+    if hasattr(config, "rope_theta"):
+        return float(config.rope_theta)
+    raise ValueError("OLMo config does not define rope_theta")
+
+
 class Olmo2Attention(nn.Module):
     """
     This is the attention block where the output is computed as
@@ -103,7 +112,7 @@ class Olmo2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_parameters["rope_theta"]
+        self.rope_theta = get_olmo_rope_theta(config)
 
         # Attention input projection. Projects x -> (q, k, v)
         self.qkv_proj = QKVParallelLinear(

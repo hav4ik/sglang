@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     SGLangBatchAttentionWithAttentionSinkWrapper,
     _run_flashinfer_paged_with_sinks,
 )
+from sglang.srt.models.olmo2 import get_olmo_rope_theta
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
@@ -127,6 +128,17 @@ def test_yccchen_deploy_config_preserves_sink_architecture():
     assert hf_config.num_attention_heads == 40
     assert hf_config.num_key_value_heads == 8
     assert hf_config.sink_init_value == 0.0
+
+
+def test_yccchen_rope_theta_accepts_transformers_5_schema():
+    config = SimpleNamespace(
+        rope_parameters={"rope_type": "yarn", "factor": 32.0},
+        rope_theta=500000,
+    )
+    assert get_olmo_rope_theta(config) == 500000
+
+    config.rope_parameters["rope_theta"] = 10000
+    assert get_olmo_rope_theta(config) == 10000
 
 
 def test_sink_models_disable_ragged_prefill():
