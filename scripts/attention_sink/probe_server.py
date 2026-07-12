@@ -12,8 +12,13 @@ import requests
 
 def post(url, endpoint, payload, timeout):
     response = requests.post(f"{url}{endpoint}", json=payload, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+    try:
+        body = response.json()
+    except requests.exceptions.JSONDecodeError:
+        body = response.text
+    if not response.ok:
+        raise RuntimeError(f"{endpoint} returned HTTP {response.status_code}: {body!r}")
+    return body
 
 
 def validate_generation_result(result, prompt_length):
@@ -165,6 +170,7 @@ def main():
         )
         if args.reload_model:
             change_error = None
+            restore_error = None
             try:
                 report["reload_to_b"] = reload(
                     args.url,
@@ -188,14 +194,32 @@ def main():
                     )
             except Exception as exc:
                 change_error = exc
+                report["change_failure"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
             finally:
-                report["reload_to_a"] = reload(
-                    args.url,
-                    args.model,
-                    2,
-                    args.timeout,
-                    args.reload_load_format,
-                )
+                try:
+                    report["reload_to_a"] = reload(
+                        args.url,
+                        args.model,
+                        2,
+                        args.timeout,
+                        args.reload_load_format,
+                    )
+                except Exception as exc:
+                    restore_error = exc
+                    report["restore_failure"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+            if restore_error is not None:
+                if change_error is not None:
+                    raise RuntimeError(
+                        f"B phase failed ({change_error}); A restore also failed "
+                        f"({restore_error})"
+                    ) from restore_error
+                raise restore_error
             report["after_a"] = probe(
                 args.url, args.model, lengths, args.output_tokens, args.timeout
             )
