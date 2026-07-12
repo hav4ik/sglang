@@ -27,6 +27,7 @@ docker buildx create --name "$BUILDER" --driver docker-container --use >/dev/nul
 docker buildx inspect --bootstrap >/dev/null
 docker buildx build "$ROOT" \
   --builder "$BUILDER" \
+  --file "$ROOT/docker/Dockerfile" \
   --platform linux/amd64 \
   --target attention_sink_dev \
   --build-arg CUDA_VERSION=12.8.1 \
