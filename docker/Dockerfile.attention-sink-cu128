@@ -61,8 +61,8 @@ RUN uv pip install --python /usr/bin/python --no-cache \
 
 # Build SGLang's native kernel wheel with this image's nvcc 12.8. No cu129
 # artifact is accepted in this image.
-RUN CMAKE_ARGS="-DENABLE_BELOW_SM90=OFF -DSGL_KERNEL_COMPILE_THREADS=4" \
-    CMAKE_BUILD_PARALLEL_LEVEL=4 \
+RUN CMAKE_ARGS="-DENABLE_BELOW_SM90=OFF -DSGL_KERNEL_COMPILE_THREADS=1" \
+    CMAKE_BUILD_PARALLEL_LEVEL=2 \
     uv pip install --python /usr/bin/python --no-cache \
         --no-build-isolation --no-deps ./sgl-kernel
 
