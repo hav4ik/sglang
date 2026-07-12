@@ -58,8 +58,9 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
 
-# Aligned with HF's implementation, using sliding window inclusive with the last token
-# SGLang assumes exclusive
+# HF/OLMo's window includes the current real token. The virtual sink is added to
+# the softmax denominator after masking and does not consume a window position.
+# SGLang stores window_left, so convert 4096 real tokens to 4095 predecessors.
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1 if hasattr(config, "sliding_window") else None
 

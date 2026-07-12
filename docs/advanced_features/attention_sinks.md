@@ -20,6 +20,12 @@ The eager reference, SGLang Triton kernels, and FlashInfer's dedicated
 `sinks=` to an ordinary FlashInfer paged wrapper is not sufficient and may be
 silently ignored, so sink models exclusively use the dedicated wrapper.
 
+The sink is not a sequence position and does not consume the sliding window.
+OLMo training converts `sliding_window=4096` to FlashAttention's inclusive
+`window_size=(4095, 0)`, which retains 4096 real KV positions. The sink is added
+after that mask as one extra denominator-only entry, so a saturated SWA query
+normalizes over 4096 real-token logits plus the sink logit.
+
 FlashInfer 0.6.14's dedicated wrapper gives BF16-KV and FP8-KV sink kernels the
 same JIT cache identity because that identity omits the KV dtype. SGLang uses
 FlashInfer's own dtype-complete sink URI helper when constructing the otherwise
