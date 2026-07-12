@@ -80,10 +80,16 @@ cleanup_server() {
   if [ -n "${server_pid:-}" ]; then
     kill -- -"$server_pid" 2>/dev/null || true
     for _ in $(seq 1 30); do
-      kill -0 "$server_pid" 2>/dev/null || break
+      if ! ps -eo pgid=,stat= | awk -v target="$server_pid" \
+        '$1 == target && $2 !~ /^Z/ { found = 1 } END { exit !found }'; then
+        break
+      fi
       sleep 1
     done
-    kill -KILL -- -"$server_pid" 2>/dev/null || true
+    if ps -eo pgid=,stat= | awk -v target="$server_pid" \
+      '$1 == target && $2 !~ /^Z/ { found = 1 } END { exit !found }'; then
+      kill -KILL -- -"$server_pid" 2>/dev/null || true
+    fi
     wait "$server_pid" 2>/dev/null || true
   fi
   if [ -n "${monitor_pid:-}" ]; then
