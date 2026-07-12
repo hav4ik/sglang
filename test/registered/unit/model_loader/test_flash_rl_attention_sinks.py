@@ -220,6 +220,33 @@ def test_flash_rl_rejects_missing_stacked_scale_before_commit():
     torch.testing.assert_close(params[scale_name], torch.zeros(1, 6))
 
 
+def test_flash_rl_applies_gqa_qkv_scales_with_unequal_shard_rows():
+    param_name = "model.layers.0.self_attn.qkv_proj.weight"
+    scale_name = "model.layers.0.self_attn.qkv_proj.weight_scale"
+    params = {scale_name: torch.nn.Parameter(torch.zeros(1, 3584))}
+    scales = {
+        "q": torch.ones(5120, 1),
+        "k": torch.full((1024, 1), 2.0),
+        "v": torch.full((1024, 1), 3.0),
+    }
+
+    with patch(
+        "sglang.srt.model_loader.loader.get_parallel",
+        return_value=SimpleNamespace(tp_rank=1, tp_size=2),
+    ):
+        QuantizedRLModelLoader._apply_scale_update(params, param_name, scales)
+
+    expected = torch.cat(
+        [
+            torch.ones(1, 2560),
+            torch.full((1, 512), 2.0),
+            torch.full((1, 512), 3.0),
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(params[scale_name], expected)
+
+
 def test_flash_rl_does_not_nest_reload_proxy():
     class _Model:
         def __init__(self):

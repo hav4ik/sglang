@@ -1151,6 +1151,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 return full_scale_tensor
 
             full_dim = full_scale_tensor.shape[0]
+            if full_dim % tp_size:
+                raise RuntimeError(
+                    f"Scale rows {full_dim} are not divisible by TP size {tp_size}"
+                )
             shard_dim = full_dim // tp_size
             start_idx = tp_rank * shard_dim
             end_idx = start_idx + shard_dim
@@ -1192,12 +1196,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 ),
                 [],
             )
-            rows_per_shard = scale_param.data.shape[-1] // max(len(shard_names), 1)
-            if rows_per_shard * len(shard_names) != scale_param.data.shape[-1]:
-                raise RuntimeError(
-                    f"Scale param shape {scale_param.data.shape[-1]} not divisible "
-                    f"by {len(shard_names)}"
-                )
             offset = 0
             for idx, shard in enumerate(shard_names):
                 shard_id = (
