@@ -31,6 +31,9 @@ trap 'rm -rf "$CARGO_TARGET_DIR"' EXIT
 "$PYTHON" -m pip install --no-cache-dir --no-deps --no-build-isolation \
   -e "$CHECKOUT/python"
 
+# Avoid the checkout directory itself being resolved as a namespace package
+# when bootstrap was invoked from its parent (for example, /workspace).
+cd "$CHECKOUT"
 "$PYTHON" - <<'PY'
 import importlib.metadata as md
 import inspect
