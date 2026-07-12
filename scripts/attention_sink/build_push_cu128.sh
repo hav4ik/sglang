@@ -39,6 +39,7 @@ docker buildx build "$ROOT" \
   --build-arg SGLANG_IMAGE_TAG="$IMAGE" \
   --tag "$IMAGE" \
   --tag "$REVISION_TAG" \
+  --progress plain \
   --push
 
 echo "pushed $IMAGE"

@@ -802,9 +802,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     perftest \
     # Build tools for JIT compilation
     ninja-build \
-    # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
-    libnccl2 \
-    libnccl-dev \
+    # The CUDA devel base already supplies matching NCCL runtime/dev packages.
+    # Reinstalling unpinned names can upgrade a cu12 image to CUDA-13 NCCL.
     # GPG key verification
     gnupg2 \
     linux-libc-dev \
@@ -908,6 +907,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pytest pytest-asyncio setuptools-rust setuptools-scm wheel \
     && rustc --version \
     && cargo --version
+
+RUN python3 - <<'PY'
+import importlib.metadata as md
+import re
+import subprocess
+
+import torch
+
+assert str(torch.version.cuda or "").startswith("12.8"), torch.version.cuda
+assert md.version("flashinfer-python") == "0.6.14"
+freeze = subprocess.check_output(
+    ["python3", "-m", "pip", "list", "--format=freeze"], text=True
+)
+cu13 = [
+    line
+    for line in freeze.splitlines()
+    if re.search(r"(cu13|cuda[-_]?13)", line.split("==", 1)[0], re.I)
+]
+assert not cu13, f"CUDA-13 Python packages found in cu128 image: {cu13}"
+PY
+RUN dpkg-query -W libnccl2 libnccl-dev | tee /tmp/nccl-packages.txt \
+    && ! grep -i 'cuda13' /tmp/nccl-packages.txt \
+    && rm /tmp/nccl-packages.txt
 
 COPY --chmod=755 scripts/attention_sink/bootstrap_checkout.sh \
     /usr/local/bin/sglang-sink-bootstrap
