@@ -8,6 +8,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
+    SGLangBatchAttentionWithAttentionSinkWrapper,
     _run_flashinfer_paged_with_sinks,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -62,6 +63,31 @@ def test_flashinfer_sink_jit_requires_float32_sinks():
             sinks=torch.randn(4, dtype=torch.bfloat16),
             window_left=32,
         )
+
+
+def test_sink_jit_cache_identity_includes_kv_dtype():
+    workspace = torch.empty(1, dtype=torch.uint8)
+    target = (
+        "sglang.srt.layers.attention.flashinfer_backend."
+        "BatchPrefillWithPagedKVCacheWrapper.__init__"
+    )
+    with patch(target, return_value=None) as parent_init:
+        SGLangBatchAttentionWithAttentionSinkWrapper(
+            workspace,
+            backend="fa2",
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
+        bf16_uri = parent_init.call_args.kwargs["jit_args"][0]
+        SGLangBatchAttentionWithAttentionSinkWrapper(
+            workspace,
+            backend="fa2",
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.float8_e4m3fn,
+        )
+        fp8_uri = parent_init.call_args.kwargs["jit_args"][0]
+
+    assert bf16_uri != fp8_uri
 
 
 def test_olmo3_sink_config_detection():

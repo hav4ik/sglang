@@ -123,15 +123,103 @@ if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
 
 if is_flashinfer_available():
     from flashinfer import (
-        BatchAttentionWithAttentionSinkWrapper,
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
+    from flashinfer.jit.attention.modules import get_batch_prefill_attention_sink_uri
+    from flashinfer.jit.attention.variants import attention_sink_decl
+    from flashinfer.utils import PosEncodingMode, determine_attention_backend
 
     from sglang.kernels.ops.attention.merge_state import merge_state_triton
+
+    class SGLangBatchAttentionWithAttentionSinkWrapper(
+        BatchPrefillWithPagedKVCacheWrapper
+    ):
+        """FlashInfer sink wrapper with a dtype-complete JIT cache identity."""
+
+        def __init__(
+            self,
+            float_workspace_buffer,
+            kv_layout="NHD",
+            use_cuda_graph=False,
+            qo_indptr_buf=None,
+            paged_kv_indptr_buf=None,
+            paged_kv_indices_buf=None,
+            paged_kv_last_page_len_buf=None,
+            custom_mask_buf=None,
+            mask_indptr_buf=None,
+            backend="auto",
+            pos_encoding_mode="NONE",
+            use_fp16_qk_reduction=False,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            head_dim_qk=128,
+            head_dim_vo=128,
+            window_left=-1,
+        ):
+            if backend not in ("fa2", "fa3", "auto"):
+                raise ValueError(f"unsupported FlashInfer sink backend: {backend}")
+            if backend == "auto":
+                backend = determine_attention_backend(
+                    float_workspace_buffer.device,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    use_fp16_qk_reduction,
+                    custom_mask_buf is not None,
+                    q_data_type,
+                    kv_data_type,
+                )
+
+            pos_encoding_mode_value = PosEncodingMode[pos_encoding_mode].value
+            uri = get_batch_prefill_attention_sink_uri(
+                backend,
+                q_data_type,
+                kv_data_type,
+                q_data_type,
+                torch.int32,
+                head_dim_qk,
+                head_dim_vo,
+                pos_encoding_mode_value,
+                window_left >= 0,
+            )
+            if use_fp16_qk_reduction:
+                uri += "_f16qk_true"
+            jit_args = [
+                uri,
+                q_data_type,
+                kv_data_type,
+                q_data_type,
+                torch.int32,
+                head_dim_qk,
+                head_dim_vo,
+                ["sink"],
+                ["float"],
+                ["sm_scale"],
+                ["double"],
+                "AttentionSink",
+                attention_sink_decl[backend],
+            ]
+            jit_kwargs = {
+                "use_sliding_window": window_left >= 0,
+                "use_fp16_qk_reduction": use_fp16_qk_reduction,
+                "pos_encoding_mode": pos_encoding_mode_value,
+            }
+            super().__init__(
+                float_workspace_buffer=float_workspace_buffer,
+                kv_layout=kv_layout,
+                use_cuda_graph=use_cuda_graph,
+                qo_indptr_buf=qo_indptr_buf,
+                paged_kv_indptr_buf=paged_kv_indptr_buf,
+                paged_kv_indices_buf=paged_kv_indices_buf,
+                paged_kv_last_page_len_buf=paged_kv_last_page_len_buf,
+                custom_mask_buf=custom_mask_buf,
+                mask_indptr_buf=mask_indptr_buf,
+                backend=backend,
+                jit_args=jit_args,
+                jit_kwargs=jit_kwargs,
+            )
 
     # FlashInfer's MergeState CUDA kernel uses blockDim = (head_dim/vec_size, num_heads).
     # When num_heads is large (e.g. with DP attention where attention_tp_size=1), the
@@ -580,7 +668,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
         window_left = self._sink_window_left(wrapper_id)
-        wrapper = BatchAttentionWithAttentionSinkWrapper(
+        wrapper = SGLangBatchAttentionWithAttentionSinkWrapper(
             workspace,
             "NHD",
             backend=self.prefill_backend,

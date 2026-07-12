@@ -20,6 +20,12 @@ The eager reference, SGLang Triton kernels, and FlashInfer's dedicated
 `sinks=` to an ordinary FlashInfer paged wrapper is not sufficient and may be
 silently ignored, so sink models exclusively use the dedicated wrapper.
 
+FlashInfer 0.6.14's dedicated wrapper gives BF16-KV and FP8-KV sink kernels the
+same JIT cache identity because that identity omits the KV dtype. SGLang uses
+FlashInfer's own dtype-complete sink URI helper when constructing the otherwise
+identical custom kernel, preventing a shared BF16 cache entry from being reused
+as FP8 (or vice versa).
+
 ## Checkpoint Contract
 
 The 32B deploy config has 64 layers, 40 query heads, 8 KV heads, hidden size

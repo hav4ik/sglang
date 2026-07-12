@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.extend_attention import (  # noqa: E402
     extend_attention_fwd,
 )
 from sglang.srt.layers.attention.flashinfer_backend import (  # noqa: E402
+    SGLangBatchAttentionWithAttentionSinkWrapper,
     _run_flashinfer_paged_with_sinks,
 )
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
@@ -75,7 +76,7 @@ def _flashinfer_attention(q, k, v, sinks, window_left):
         device=q.device,
     )
     workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-    wrapper = flashinfer.BatchAttentionWithAttentionSinkWrapper(
+    wrapper = SGLangBatchAttentionWithAttentionSinkWrapper(
         workspace,
         "NHD",
         backend="fa2",
@@ -311,7 +312,7 @@ def test_flashinfer_attention_sinks_cuda_graph_reads_reloaded_values(
     kv_cache, kv_indptr, kv_indices, last_page_len = _paged_kv(k, v)
     qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
     workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
-    wrapper = flashinfer.BatchAttentionWithAttentionSinkWrapper(
+    wrapper = SGLangBatchAttentionWithAttentionSinkWrapper(
         workspace,
         "NHD",
         use_cuda_graph=True,
