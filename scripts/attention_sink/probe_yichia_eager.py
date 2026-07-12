@@ -6,6 +6,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -29,21 +30,39 @@ def require_source(source: Path) -> None:
         )
 
 
-def sink_summary(model) -> dict:
-    sinks = [
-        parameter.detach().float().cpu().contiguous()
-        for name, parameter in model.named_parameters()
-        if name.endswith(".self_attn.sinks")
+def sink_summary(model, model_dir: str) -> dict:
+    parameters = dict(model.named_parameters())
+    sink_names = {name for name in parameters if name.endswith(".self_attn.sinks")}
+    if len(sink_names) != 64:
+        raise RuntimeError(f"expected 64 attention-sink tensors, got {len(sink_names)}")
+
+    index = json.loads((Path(model_dir) / "model.safetensors.index.json").read_text())[
+        "weight_map"
     ]
-    if len(sinks) != 64:
-        raise RuntimeError(f"expected 64 attention-sink tensors, got {len(sinks)}")
-    flattened = torch.cat(sinks)
+    names_by_file = defaultdict(list)
+    for name in sink_names:
+        names_by_file[index[name]].append(name)
+
+    digest = hashlib.sha256()
+    values = []
+    for filename, names in sorted(names_by_file.items()):
+        for name in sorted(names):
+            parameter = parameters[name]
+            if parameter.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    f"expected BF16 runtime sink {name}, got {parameter.dtype}"
+                )
+            tensor = parameter.detach().cpu().contiguous()
+            digest.update(name.encode())
+            digest.update(tensor.view(torch.uint8).numpy().tobytes())
+            values.extend(tensor.float().tolist())
+
     return {
-        "count": len(sinks),
-        "min": flattened.min().item(),
-        "max": flattened.max().item(),
-        "mean": flattened.mean().item(),
-        "sha256": hashlib.sha256(flattened.numpy().tobytes()).hexdigest(),
+        "count": len(sink_names),
+        "min": min(values),
+        "max": max(values),
+        "mean": sum(values) / len(values),
+        "checkpoint_compatible_sha256": digest.hexdigest(),
     }
 
 
@@ -130,7 +149,7 @@ def main() -> None:
         "source_revision": YICHIA_REVISION,
         "model": args.model,
         "transformers": transformers.__version__,
-        "sink_summary": sink_summary(model),
+        "sink_summary": sink_summary(model, args.model),
         "initial": [probe(model, args.length, args.output_tokens)],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
