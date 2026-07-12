@@ -242,15 +242,13 @@ checkpoint. The FP8 A -> B -> A cycle above is the full-checkpoint FlashRL test.
 
 Reload probes use `pause_generation(mode="in_place")`, update with
 `flush_cache=False`, and then continue generation. This is the AsyncRL hot-swap
-contract for the OLMo3 FlashRL disk loader: it stages the replacement parameters
-and synchronizes CUDA before committing the live buffers, while active-request KV
-is retained. `in_place` does not by itself make generic or direct tensor loaders
-safe against an outstanding CUDA forward. An active request can resume with KV
-produced by the old weights and generate later tokens with the new weights. This
-is not per-request model-version isolation. The validation server disables radix
-caching so a new request cannot reuse another request's old-version prefix KV;
-deployments that retain shared prefix caches need model-versioned cache entries
-or an explicit invalidation policy.
+contract: scheduler forwards are quiesced during mutation, and active-request KV
+is retained. An active request can therefore resume with KV produced by the old
+weights and generate later tokens with the new weights. This is not per-request
+model-version isolation. The validation server disables radix caching so a new
+request cannot reuse another request's old-version prefix KV; deployments that
+retain shared prefix caches need model-versioned cache entries or an explicit
+invalidation policy.
 
 Recommended hardware allocation:
 
@@ -274,9 +272,8 @@ Acceptance criteria:
 - Kernel comparisons pass at declared BF16/FP8 tolerances.
 - Sentinel sinks `-20`, `0`, and `+8` materially change output as eager predicts.
 - Triton and FlashInfer produce identical greedy server tokens.
-- Same-backend A -> B -> A restores output-token logprobs within `0.05`.
-- Full-model Triton/FlashInfer logprobs differ by at most `0.125` with BF16
-  weights and `0.25` with FP8 weights; greedy tokens must still match exactly.
+- Output-token logprobs differ by at most `0.05`.
+- A -> B -> A reproduces A's output IDs and logprobs.
 - Every TP rank reports 64 sink checksums, updated shards are rank-distinct, and
   restore reproduces the original per-engine sink checksum exactly.
 - A request observed as running before an in-place update completes all requested
@@ -293,8 +290,6 @@ Acceptance criteria:
   test; the provided H100/B200 matrix covers TP 1/2.
 - Non-unit FP8 K/V scales are not covered by the direct kernel fixture.
 - Injected mid-commit GPU failure and single-TP-rank failure need fail-stop tests.
-- Generic tensor and distributed AsyncRL loaders need an explicit CUDA drain or
-  equivalent stream dependency before they can claim safe in-flight mutation.
 - Cold-start and FlashRL FP8 quantization of row-parallel projections should be
   aligned so the initial policy is independent of whether it came through reload.
 - In-place, no-flush reload intentionally admits mixed-version trajectories for

@@ -213,15 +213,9 @@ PY
 done
 if [ -f "$RESULTS/probe-triton-$kv_cache_dtype-$quantization.json" ] && \
    [ -f "$RESULTS/probe-flashinfer-$kv_cache_dtype-$quantization.json" ]; then
-  if [ "$quantization" = none ]; then
-    backend_logprob_atol="${BACKEND_LOGPROB_ATOL_BF16:-0.125}"
-  else
-    backend_logprob_atol="${BACKEND_LOGPROB_ATOL_FP8:-0.25}"
-  fi
   "$PYTHON" scripts/attention_sink/compare_probes.py \
     "$RESULTS/probe-triton-$kv_cache_dtype-$quantization.json" \
     "$RESULTS/probe-flashinfer-$kv_cache_dtype-$quantization.json" \
-    --logprob-atol "$backend_logprob_atol" \
     | tee "$RESULTS/backend-comparison-$kv_cache_dtype-$quantization.json"
 fi
 done
