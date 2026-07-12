@@ -56,8 +56,12 @@ RUN uv pip install --python /usr/bin/python --no-cache \
         --index-url https://flashinfer.ai/whl/cu128 \
         flashinfer-jit-cache==0.6.14 \
     && uv pip install --python /usr/bin/python --no-cache \
-        pytest pytest-asyncio scikit-build-core setuptools setuptools-rust \
-        setuptools-scm wheel
+        cuda-tile==1.4.0 \
+        nvidia-cudnn-frontend==1.13.0 \
+        nvidia-cutlass-dsl==4.5.2 \
+        nvidia-ml-py==12.575.51 \
+        pytest pytest-asyncio scikit-build-core setuptools \
+        setuptools-rust setuptools-scm wheel
 
 # SGLang does not publish a cu128 wheel for kernel 0.4.4. This official cu129
 # wheel contains native sm90/sm120a cubins, no PTX, and links CUDA 12.x SONAMEs.
