@@ -6,6 +6,7 @@ RESULTS="${RESULTS:-$ROOT/attention-sink-results/$(date +%Y%m%d-%H%M%S)}"
 PYTHON="${PYTHON:-python}"
 PROFILE="${PROFILE:-kernel}"
 mkdir -p "$RESULTS"
+rm -f "$RESULTS/completion.json"
 cd "$ROOT"
 
 write_completion() {
