@@ -60,11 +60,6 @@ if [ "${SKIP_KERNEL_TESTS:-0}" != 1 ]; then
     test/manual/attention/test_attention_sink_hardware.py \
     | tee "$RESULTS/long-context-tests.txt"
 
-  if [ "${RUN_DISTRIBUTED_TRANSPORT_TESTS:-0}" = 1 ]; then
-    "$PYTHON" -m pytest -q -s \
-      test/registered/rl/test_update_weights_from_tensor.py::TestUpdateWeightsFromTensor::test_update_weights_from_tensor \
-      | tee "$RESULTS/distributed-tensor-transport.txt"
-  fi
 fi
 
 if [ "$PROFILE" = kernel ]; then

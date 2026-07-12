@@ -226,24 +226,12 @@ loader, which slices a distinct range on every TP rank. It does not use FlashRL,
 because the transactional FlashRL loader requires a complete 771-weight
 checkpoint. The FP8 A -> B -> A cycle above is the full-checkpoint FlashRL test.
 
-Run the generic tensor-transport integration once at TP=2 before the 32B model:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 python -m pytest -q -s \
-  test/registered/rl/test_update_weights_from_tensor.py::TestUpdateWeightsFromTensor::test_update_weights_from_tensor
-```
-
-Equivalently, set `RUN_DISTRIBUTED_TRANSPORT_TESTS=1` when running the kernel
-profile on a process with both GPUs visible; its output is then captured in the
-same result directory.
-
 Recommended hardware allocation:
 
 | Qualification | H100 | B200 |
 |---|---:|---:|
 | Targeted unit/kernel suite | 1 GPU | 1 GPU |
 | Real 32B server and A -> B -> A | 2 GPUs, TP=2 | 1 GPU TP=1, then 2 GPUs TP=2 |
-| Generic distributed tensor transport | 2 GPUs | 2 GPUs |
 | Synthetic sender-to-TP2 full BF16 update | Not recommended at 80 GB | 3 GPUs minimum |
 
 The last row needs one sender/staging GPU plus two rollout GPUs concurrently.
