@@ -104,6 +104,8 @@ COPY --chmod=755 scripts/attention_sink/run_all_tests.sh \
     /usr/local/bin/sglang-sink-tests
 COPY --chmod=755 scripts/attention_sink/check_cuda_128.py \
     /usr/local/bin/sglang-sink-check-cuda
+COPY --chmod=755 scripts/attention_sink/check_b200_environment.py \
+    /usr/local/bin/sglang-sink-check-b200
 
 RUN mkdir -p /workspace /cache/flashinfer /cache/triton \
     && chmod -R 777 /cache

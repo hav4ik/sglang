@@ -6,7 +6,9 @@ attention-sink logit per query head. The target artifact is
 path remains the rollout default; FlashInfer is an explicit, release-gated option.
 The audited model revision is `39beac79e6857df6d8a0dc27210f5affa4031c92`.
 The complete implementation and qualification record is maintained in
-[attention_sinks_audit.md](attention_sinks_audit.md).
+[attention_sinks_audit.md](attention_sinks_audit.md). The B200 image choice,
+CUDA compatibility analysis, and bring-up commands are recorded in
+[attention_sinks_b200_container.md](attention_sinks_b200_container.md).
 
 ## Semantics
 
@@ -198,6 +200,13 @@ These cover target 40:8 GQA, head dimension 128, prefill, cached extend, decode,
 full attention, short-window SWA, BF16 KV, FP8 KV on supported GPUs, and direct
 FlashInfer CUDA graph replay after sink mutation at batch sizes 1, 2, and 8.
 
+The serving backend is selected at process startup with
+`--attention-backend triton` or `--attention-backend flashinfer`. Both consume
+the same checkpoint and support complete AsyncRL sink reloads. Switching
+backends requires a server restart and therefore does not preserve active
+requests or KV cache; split prefill/decode backend combinations are not in the
+qualified envelope.
+
 ## H100/B200 Qualification
 
 The CUDA 12.8 development image contains all Python, CUDA, Rust, and protobuf
@@ -211,6 +220,7 @@ docker run --rm -it --gpus all --ipc=host \
   chankhavu/proofpilot-sglang-sink:flashinfer-sink-cu128
 sglang-sink-bootstrap
 sglang-sink-check-cuda
+python scripts/attention_sink/check_b200_environment.py  # B200/R570 only
 sglang-sink-tests
 ```
 

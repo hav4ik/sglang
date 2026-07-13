@@ -5,6 +5,8 @@ This document is the engineering record for serving
 fork. It records what changed, what was actually tested, known numerical and
 operational differences, and the remaining release gates. Operational commands
 live in [attention_sinks.md](attention_sinks.md).
+The B200 container decision and image audit live in
+[attention_sinks_b200_container.md](attention_sinks_b200_container.md).
 
 ## Snapshot
 
