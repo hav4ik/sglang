@@ -44,11 +44,16 @@ import subprocess
 import flashinfer
 import sglang
 import torch
+import torchaudio
+import torchvision
 
 checkout = os.path.realpath(os.environ.get("SGLANG_CHECKOUT", "/workspace/sglang"))
 source = os.path.realpath(inspect.getfile(sglang))
 assert source.startswith(checkout + os.sep), (source, checkout)
 assert str(torch.version.cuda or "").startswith("12.8"), torch.version.cuda
+assert torch.__version__ == "2.11.0+cu128", torch.__version__
+assert torchaudio.__version__ == "2.11.0+cu128", torchaudio.__version__
+assert torchvision.__version__ == "0.26.0+cu128", torchvision.__version__
 assert md.version("flashinfer-python") == "0.6.14"
 assert hasattr(flashinfer, "BatchAttentionWithAttentionSinkWrapper")
 

@@ -1,0 +1,8 @@
+# PyTorch 2.11 wheel metadata omits the CUDA local tag. The Dockerfile first
+# installs these from the cu128-only index with explicit +cu128 requirements;
+# these public-version constraints then keep later dependency resolution from
+# changing the framework versions. The runtime gate checks module __version__
+# values to prove that the installed builds remain +cu128.
+torch==2.11.0
+torchaudio==2.11.0
+torchvision==0.26.0

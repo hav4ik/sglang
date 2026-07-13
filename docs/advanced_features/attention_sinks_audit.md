@@ -27,6 +27,11 @@ The image permits the checksum-pinned `sglang-kernel==0.4.4+cu129` wheel as a
 documented native-wheel exception. It contains architecture cubins and runs
 against the CUDA 12.8 runtime. CUDA Python API packages at 12.9.4 are bindings,
 not a newer toolkit or runtime.
+Torch, torchvision, and torchaudio are installed from the cu128-only index with
+explicit `+cu128` requirements because the public `==2.11.0` requirement alone
+does not distinguish cu128 from cu130.
+On GPU nodes the gate additionally requires the injected `libcuda` Driver API
+to report 12.8 and rejects newer CUDA compatibility packages.
 
 ## Status
 

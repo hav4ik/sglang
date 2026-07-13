@@ -11,6 +11,22 @@ qualification image. It contains CUDA toolkit/runtime 12.8, Torch
 `2.11.0+cu128`, and FlashInfer 0.6.14, which is the exact FlashInfer version
 targeted by the custom sink-kernel plumbing.
 
+Here, `cu128` describes the operational compiler, runtime, framework, and
+driver-API contract. It does not claim that every package version string is
+`cu128`. Two audited exceptions remain: CUDA Python API wrappers at 12.9.4 and
+the checksum-pinned `sglang-kernel==0.4.4+cu129` wheel. The latter contains
+precompiled `sm90`/`sm100`/`sm120a` cubins without PTX and resolves CUDA 12
+SONAMEs from the 12.8 image. It passed H100 testing but is not considered B200
+qualified until the R570 hardware matrix passes.
+
+The image does not use a normal dependency-resolving `pip install sglang` at
+runtime. SGLang's public `torch==2.11.0` requirement accepts both `+cu128` and
+`+cu130` local builds. The image therefore installs Torch, torchvision, and
+torchaudio from PyTorch's cu128-only index with explicit `+cu128` requirements
+before resolving other packages, and the editable bootstrap uses `--no-deps`.
+The CUDA gate verifies the imported modules' local versions after every
+bootstrap because PyTorch 2.11 distribution metadata omits the CUDA build tag.
+
 Do not use `lmsysorg/sglang:v0.5.14-cu129` as the release image when the cluster
 contract forbids operational CUDA components newer than 12.8. An R570 driver
 can load many CUDA 12.9 applications through CUDA 12.x minor-version
@@ -90,6 +106,20 @@ The check requires an R570 driver by default, every visible GPU to report
 compute capability 10.0, FlashInfer 0.6.14, and the complete CUDA 12.8 gate.
 Override `--driver-major` only when intentionally qualifying a different driver
 branch.
+
+At runtime the CUDA gate checks both sides of the API boundary:
+
+- `nvcc`, Torch, `libcudart`, toolkit packages, and filesystem toolkits must be
+  CUDA 12.8.
+- The injected `libcuda.so.1` Driver API must report 12.8 as well.
+- `cuda-compat-12-9` and all `cuda-compat-13-*` packages are rejected.
+
+NVIDIA's forward-compatibility mechanism can expose a newer `libcuda` interface
+over an older kernel driver, and it is limited to data-center GPUs, selected
+server-ready RTX systems, and Jetson. That is a valid deployment mechanism for
+an intentionally newer CUDA application, but it is not used by this strict
+cu128 image. R570 is the driver paired with CUDA 12.8, so B200 does not need a
+CUDA 13 compatibility interface for this stack.
 
 ## Backend Fallback
 

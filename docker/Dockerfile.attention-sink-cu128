@@ -31,9 +31,20 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 COPY . /opt/sglang-candidate
 WORKDIR /opt/sglang-candidate
 
+# PyTorch 2.11 wheel metadata does not retain the CUDA build tag. Install from
+# the cu128-only index with explicit +cu128 requirements before resolving
+# packages such as timm, constrain the public versions thereafter, and verify
+# the imported modules' build tags in the final image gate.
+RUN uv pip install --python /usr/bin/python --no-cache --no-deps \
+        --index-url https://download.pytorch.org/whl/cu128 \
+        torch==2.11.0+cu128 \
+        torchaudio==2.11.0+cu128 \
+        torchvision==0.26.0+cu128
+
 # CUDA 12.9 Python API bindings are required by torch 2.11+cu128. They do not
 # ship nvcc, libcudart, or native CUDA libraries.
 RUN uv pip install --python /usr/bin/python --no-cache \
+        --constraints docker/attention-sink-cu128-constraints.txt \
         cuda-python==12.9.4 cuda-bindings==12.9.4 \
     && python - <<'PY' >/tmp/sglang-runtime.txt
 import tomllib
@@ -45,6 +56,7 @@ for requirement in data["project"]["optional-dependencies"]["runtime_common"]:
         print(requirement)
 PY
 RUN uv pip install --python /usr/bin/python --no-cache \
+        --constraints docker/attention-sink-cu128-constraints.txt \
         -r /tmp/sglang-runtime.txt \
     && uv pip install --python /usr/bin/python --no-cache --no-deps \
         torchao==0.17.0 \
@@ -56,6 +68,7 @@ RUN uv pip install --python /usr/bin/python --no-cache \
         --index-url https://flashinfer.ai/whl/cu128 \
         flashinfer-jit-cache==0.6.14 \
     && uv pip install --python /usr/bin/python --no-cache \
+        --constraints docker/attention-sink-cu128-constraints.txt \
         cuda-tile==1.4.0 \
         nvidia-cudnn-frontend==1.13.0 \
         nvidia-cutlass-dsl==4.5.2 \

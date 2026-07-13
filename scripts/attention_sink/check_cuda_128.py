@@ -2,6 +2,7 @@
 """Fail unless every operational CUDA component is CUDA 12.8 or older."""
 
 import ctypes
+import importlib
 import importlib.metadata as md
 import json
 import re
@@ -15,6 +16,11 @@ from packaging.version import Version
 
 MAX_CUDA = Version("12.8")
 NATIVE_BINARY_EXCEPTIONS = {"sglang-kernel": "0.4.4+cu129"}
+TORCH_FAMILY = {
+    "torch": "2.11.0+cu128",
+    "torchaudio": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+}
 
 
 def command(*args):
@@ -55,6 +61,19 @@ def main():
     except Exception as exc:
         errors.append(f"cannot validate torch CUDA build: {exc}")
 
+    torch_family_report = {}
+    for package, expected in TORCH_FAMILY.items():
+        try:
+            version = importlib.import_module(package).__version__
+            torch_family_report[package] = version
+            if version != expected:
+                errors.append(f"{package} must be {expected}, got {version}")
+        except Exception as exc:
+            errors.append(
+                f"cannot validate required cu128 package {package}=={expected}: {exc}"
+            )
+    report["torch_family"] = torch_family_report
+
     try:
         runtime = ctypes.CDLL("libcudart.so")
         runtime_version = ctypes.c_int()
@@ -67,6 +86,25 @@ def main():
             )
     except Exception as exc:
         errors.append(f"cannot validate libcudart: {exc}")
+
+    # libcuda is the user-mode Driver API supplied by the host driver or by a
+    # cuda-compat package. It is normally absent during an image build; when a
+    # GPU runtime is injected, require the R570/CUDA-12.8 interface as well.
+    driver_runtime_present = Path("/dev/nvidiactl").exists()
+    try:
+        driver_api = ctypes.CDLL("libcuda.so.1")
+        driver_api_version = ctypes.c_int()
+        status = driver_api.cuDriverGetVersion(ctypes.byref(driver_api_version))
+        report["libcuda_driver_api"] = driver_api_version.value
+        if status != 0 or driver_api_version.value // 10 != 1208:
+            errors.append(
+                f"libcuda Driver API must report 12080-12089, got "
+                f"status={status}, version={driver_api_version.value}"
+            )
+    except Exception as exc:
+        report["libcuda_driver_api"] = f"unavailable: {exc}"
+        if driver_runtime_present:
+            errors.append(f"cannot validate injected libcuda Driver API: {exc}")
 
     # torch 2.11+cu128 requires cuda-bindings>=12.9.4. cuda-python is only a
     # metapackage for those API wrappers; neither package ships the toolkit or
@@ -123,7 +161,9 @@ def main():
                 r"cuda|cublas|cudnn|cufft|curand|cusolver|cusparse|nccl", name
             ):
                 continue
-            if re.search(r"(?:cuda)?12[._+-]?9|cuda13|\b13\.", version, re.I):
+            if re.search(r"^cuda-compat-(?:12-9|13)", name, re.I) or re.search(
+                r"(?:cuda)?12[._+-]?9|cuda13|\b13\.", version, re.I
+            ):
                 bad_dpkg.append(f"{name}={version}")
         report["forbidden_dpkg"] = bad_dpkg
         errors.extend(
