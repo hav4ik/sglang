@@ -80,7 +80,7 @@ docker run --rm -it --gpus all --ipc=host \
 
 SGLANG_REF=codex/flashinfer-attention-sink sglang-sink-bootstrap
 sglang-sink-check-cuda
-python scripts/attention_sink/check_b200_environment.py
+python /workspace/sglang/scripts/attention_sink/check_b200_environment.py
 sglang-sink-tests
 ```
 

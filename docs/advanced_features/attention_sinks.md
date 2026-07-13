@@ -220,7 +220,7 @@ docker run --rm -it --gpus all --ipc=host \
   chankhavu/proofpilot-sglang-sink:flashinfer-sink-cu128
 sglang-sink-bootstrap
 sglang-sink-check-cuda
-python scripts/attention_sink/check_b200_environment.py  # B200/R570 only
+python /workspace/sglang/scripts/attention_sink/check_b200_environment.py  # B200/R570 only
 sglang-sink-tests
 ```
 
